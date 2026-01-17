@@ -139,6 +139,10 @@ func (r *ServiceAccountReconciler) Render(
 	// owned by all topologies in a given namespace, so make sure to retain those
 	if existingServieAccount != nil {
 		renderedServiceAccount.OwnerReferences = existingServieAccount.GetOwnerReferences()
+		// Preserve any pre-provisioned pull secrets (for private launcher images) and any other
+		// secrets fields that might be managed externally.
+		renderedServiceAccount.ImagePullSecrets = existingServieAccount.ImagePullSecrets
+		renderedServiceAccount.Secrets = existingServieAccount.Secrets
 	}
 
 	return renderedServiceAccount
