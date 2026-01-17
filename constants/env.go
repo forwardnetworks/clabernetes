@@ -93,6 +93,10 @@ const (
 	// should run (vxlan/slurpeeth).
 	LauncherConnectivityKind = "LAUNCHER_CONNECTIVITY_KIND"
 
+	// LauncherNativeModeEnv is the env var that holds whether the launcher is running in native
+	// mode (sidecar).
+	LauncherNativeModeEnv = "LAUNCHER_NATIVE_MODE"
+
 	// LauncherContainerlabVersion is the env var that holds the possibly user specified version of
 	// containerlab to download and use in the launcher.
 	LauncherContainerlabVersion = "LAUNCHER_CONTAINERLAB_VERSION"

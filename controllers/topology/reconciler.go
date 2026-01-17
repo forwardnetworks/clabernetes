@@ -19,6 +19,7 @@ import (
 	apimachineryerrors "k8s.io/apimachinery/pkg/api/errors"
 	apimachinerymeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	apimachinerytypes "k8s.io/apimachinery/pkg/types"
 	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlruntimeutil "sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -36,6 +37,7 @@ type Reconciler struct {
 	roleBindingReconciler    *RoleBindingReconciler
 	configMapReconciler      *ConfigMapReconciler
 	connectivityReconciler   *ConnectivityReconciler
+	nadReconciler            *NetworkAttachmentDefinitionReconciler
 
 	// these ones are exposed for testing purposes. no reason to not expose them really anyway so
 	// no big deal. not exposing the others at this point since there isnt a reason to (yet, but
@@ -74,6 +76,10 @@ func NewReconciler(
 			configManagerGetter,
 		),
 		connectivityReconciler: NewConnectivityReconciler(
+			log,
+			configManagerGetter,
+		),
+		nadReconciler: NewNetworkAttachmentDefinitionReconciler(
 			log,
 			configManagerGetter,
 		),
@@ -930,6 +936,95 @@ func (r *Reconciler) reconcileDeploymentsHandleRestarts(
 	}
 
 	return restartNodeError
+}
+
+// ReconcileNetworkAttachmentDefinitions reconciles the network attachment definitions for the
+// topology.
+func (r *Reconciler) ReconcileNetworkAttachmentDefinitions(
+	ctx context.Context,
+	owningTopology *clabernetesapisv1alpha1.Topology,
+	reconcileData *ReconcileData,
+) error {
+	if owningTopology.Spec.Connectivity != clabernetesconstants.ConnectivityMultus {
+		return nil
+	}
+
+	nadTypeName := "network-attachment-definition"
+
+	nads, err := ReconcileResolve(
+		ctx,
+		r,
+		&unstructured.Unstructured{},
+		&unstructured.UnstructuredList{},
+		nadTypeName,
+		owningTopology,
+		reconcileData.ResolvedConfigs,
+		r.nadReconciler.Resolve,
+	)
+	if err != nil {
+		return err
+	}
+
+	for _, extraNAD := range nads.Extra {
+		err = r.deleteObj(
+			ctx,
+			extraNAD,
+			nadTypeName,
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	renderedMissingNADs := r.nadReconciler.RenderAll(
+		owningTopology,
+		nads.Missing,
+	)
+
+	for _, renderedMissingNAD := range renderedMissingNADs {
+		err = r.createObj(
+			ctx,
+			owningTopology,
+			renderedMissingNAD,
+			nadTypeName,
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	for _, existingCurrentNAD := range nads.Current {
+		renderedCurrentNAD := r.nadReconciler.Render(
+			owningTopology,
+			existingCurrentNAD.GetName(),
+		)
+
+		err = ctrlruntimeutil.SetOwnerReference(
+			owningTopology,
+			renderedCurrentNAD,
+			r.Client.Scheme(),
+		)
+		if err != nil {
+			return err
+		}
+
+		if !r.nadReconciler.Conforms(
+			existingCurrentNAD,
+			renderedCurrentNAD,
+			owningTopology.GetUID(),
+		) {
+			err = r.updateObj(
+				ctx,
+				renderedCurrentNAD,
+				nadTypeName,
+			)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }
 
 func (r *Reconciler) diffIfDebug(a, b any) {

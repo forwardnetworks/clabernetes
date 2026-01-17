@@ -137,6 +137,20 @@ func (c *Controller) reconcileResources(
 		return err
 	}
 
+	err = c.TopologyReconciler.ReconcileNetworkAttachmentDefinitions(
+		ctx,
+		topology,
+		reconcileData,
+	)
+	if err != nil {
+		c.BaseController.Log.Criticalf(
+			"failed reconciling clabernetes network attachment definitions, error: %s",
+			err,
+		)
+
+		return err
+	}
+
 	err = c.TopologyReconciler.ReconcileServices(
 		ctx,
 		topology,

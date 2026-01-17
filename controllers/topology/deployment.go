@@ -130,6 +130,7 @@ func (r *DeploymentReconciler) Render(
 		owningTopology.GetNamespace(),
 		owningTopologyName,
 		nodeName,
+		owningTopology,
 	)
 
 	r.renderDeploymentScheduling(
@@ -151,6 +152,23 @@ func (r *DeploymentReconciler) Render(
 		configVolumeName,
 		volumeMountsFromCommonSpec,
 		owningTopology,
+		clabernetesConfigs,
+	)
+
+	r.renderDeploymentNative(
+		deployment,
+		nodeName,
+		configVolumeName,
+		volumeMountsFromCommonSpec,
+		owningTopology,
+		clabernetesConfigs,
+	)
+
+	r.renderDeploymentMultus(
+		deployment,
+		owningTopology,
+		nodeName,
+		clabernetesConfigs,
 	)
 
 	r.renderDeploymentContainerEnv(
@@ -345,6 +363,7 @@ func (r *DeploymentReconciler) renderDeploymentBase(
 	namespace,
 	owningTopologyName,
 	nodeName string,
+	owningTopology *clabernetesapisv1alpha1.Topology,
 ) *k8sappsv1.Deployment {
 	annotations, globalLabels := r.configManagerGetter().GetAllMetadata()
 
@@ -366,7 +385,7 @@ func (r *DeploymentReconciler) renderDeploymentBase(
 		labels[k] = v
 	}
 
-	return &k8sappsv1.Deployment{
+	deployment := &k8sappsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        name,
 			Namespace:   namespace,
@@ -391,6 +410,7 @@ func (r *DeploymentReconciler) renderDeploymentBase(
 					Labels:      labels,
 				},
 				Spec: k8scorev1.PodSpec{
+					InitContainers:     []k8scorev1.Container{},
 					Containers:         []k8scorev1.Container{},
 					RestartPolicy:      "Always",
 					ServiceAccountName: launcherServiceAccountName(),
@@ -400,6 +420,16 @@ func (r *DeploymentReconciler) renderDeploymentBase(
 			},
 		},
 	}
+
+	if ResolveNativeMode(owningTopology) {
+		deployment.Spec.Template.Spec.ShareProcessNamespace = clabernetesutil.ToPointer(true)
+	}
+
+	if ResolveHostNetwork(owningTopology) {
+		deployment.Spec.Template.Spec.HostNetwork = true
+	}
+
+	return deployment
 }
 
 func (r *DeploymentReconciler) renderDeploymentScheduling(
@@ -657,7 +687,10 @@ func (r *DeploymentReconciler) renderDeploymentContainer(
 	configVolumeName string,
 	volumeMountsFromCommonSpec []k8scorev1.VolumeMount,
 	owningTopology *clabernetesapisv1alpha1.Topology,
+	clabernetesConfigs map[string]*clabernetesutilcontainerlab.Config,
 ) {
+	nativeMode := ResolveNativeMode(owningTopology)
+
 	image := owningTopology.Spec.Deployment.LauncherImage
 	if image == "" {
 		image = r.configManagerGetter().GetLauncherImage()
@@ -668,7 +701,7 @@ func (r *DeploymentReconciler) renderDeploymentContainer(
 		imagePullPolicy = r.configManagerGetter().GetLauncherImagePullPolicy()
 	}
 
-	container := k8scorev1.Container{
+	launcherContainer := k8scorev1.Container{
 		Name:       nodeName,
 		WorkingDir: "/clabernetes",
 		Image:      image,
@@ -715,9 +748,130 @@ func (r *DeploymentReconciler) renderDeploymentContainer(
 		ImagePullPolicy:          k8scorev1.PullPolicy(imagePullPolicy),
 	}
 
-	container.VolumeMounts = append(container.VolumeMounts, volumeMountsFromCommonSpec...)
+	launcherContainer.VolumeMounts = append(launcherContainer.VolumeMounts, volumeMountsFromCommonSpec...)
 
-	deployment.Spec.Template.Spec.Containers = []k8scorev1.Container{container}
+	if !nativeMode {
+		deployment.Spec.Template.Spec.Containers = []k8scorev1.Container{launcherContainer}
+
+		return
+	}
+
+	// native mode, so we have the sidecar and the nos container
+	launcherContainer.Name = "clabernetes-launcher"
+
+	nodeImage := clabernetesConfigs[nodeName].Topology.GetNodeImage(nodeName)
+
+	nosContainer := k8scorev1.Container{
+		Name:  nodeName,
+		Image: nodeImage,
+		VolumeMounts: []k8scorev1.VolumeMount{
+			{
+				Name:      "docker",
+				ReadOnly:  false,
+				MountPath: "/clabernetes",
+			},
+		},
+		TerminationMessagePath:   "/dev/termination-log",
+		TerminationMessagePolicy: "File",
+		ImagePullPolicy:          k8scorev1.PullPolicy(imagePullPolicy),
+	}
+
+	deployment.Spec.Template.Spec.Containers = []k8scorev1.Container{nosContainer, launcherContainer}
+}
+
+func (r *DeploymentReconciler) renderDeploymentMultus(
+	deployment *k8sappsv1.Deployment,
+	owningTopology *clabernetesapisv1alpha1.Topology,
+	nodeName string,
+	clabernetesConfigs map[string]*clabernetesutilcontainerlab.Config,
+) {
+	if owningTopology.Spec.Connectivity != clabernetesconstants.ConnectivityMultus {
+		return
+	}
+
+	r.log.Debugf("multus connectivity enabled for topology %s", owningTopology.Name)
+
+	nodeConfig, ok := clabernetesConfigs[nodeName]
+	if !ok {
+		return
+	}
+
+	topologyName := owningTopology.Name
+
+	var networkNames []string
+
+	for idx := range nodeConfig.Topology.Links {
+		// we use the index from the original links slice as the unique ID for the NAD
+		// this assumes the link order is stable, which it should be since it comes from
+		// the same topology object.
+		nadName := fmt.Sprintf("%s-l%d", topologyName, idx)
+		networkNames = append(networkNames, nadName)
+	}
+
+	if len(networkNames) == 0 {
+		return
+	}
+
+	// annotation format: k8s.v1.cni.cncf.io/networks: '[{"name": "nad1"}, {"name": "nad2"}]'
+	// for simplicity we'll just use the short format if possible, but let's do the json one
+	// to be explicit and future-proof.
+	type multusNet struct {
+		Name string `json:"name"`
+	}
+
+	multusNets := make([]multusNet, len(networkNames))
+	for i, name := range networkNames {
+		multusNets[i] = multusNet{Name: name}
+	}
+
+	multusNetsJSON, err := json.Marshal(multusNets)
+	if err != nil {
+		r.log.Criticalf("failed marshaling multus networks to json, error: %s", err)
+
+		return
+	}
+
+	if deployment.Spec.Template.Annotations == nil {
+		deployment.Spec.Template.Annotations = make(map[string]string)
+	}
+
+	deployment.Spec.Template.Annotations["k8s.v1.cni.cncf.io/networks"] = string(multusNetsJSON)
+}
+
+func (r *DeploymentReconciler) renderDeploymentNative(
+	deployment *k8sappsv1.Deployment,
+	nodeName,
+	configVolumeName string,
+	volumeMountsFromCommonSpec []k8scorev1.VolumeMount,
+	owningTopology *clabernetesapisv1alpha1.Topology,
+	clabernetesConfigs map[string]*clabernetesutilcontainerlab.Config,
+) {
+	if !ResolveNativeMode(owningTopology) {
+		return
+	}
+
+	launcherContainer := r.getLauncherContainer(deployment)
+
+	initContainer := launcherContainer.DeepCopy()
+	initContainer.Name = "clabernetes-setup"
+	initContainer.Command = []string{"/clabernetes/manager", "setup"}
+
+	deployment.Spec.Template.Spec.InitContainers = append(
+		deployment.Spec.Template.Spec.InitContainers,
+		*initContainer,
+	)
+}
+
+func (r *DeploymentReconciler) getLauncherContainer(
+	deployment *k8sappsv1.Deployment,
+) *k8scorev1.Container {
+	for i := range deployment.Spec.Template.Spec.Containers {
+		if deployment.Spec.Template.Spec.Containers[i].Name == "clabernetes-launcher" {
+			return &deployment.Spec.Template.Spec.Containers[i]
+		}
+	}
+
+	return &deployment.Spec.Template.Spec.Containers[0]
 }
 
 func (r *DeploymentReconciler) renderDeploymentContainerEnv( //nolint: funlen
@@ -841,6 +995,16 @@ func (r *DeploymentReconciler) renderDeploymentContainerEnv( //nolint: funlen
 		},
 	}
 
+	if ResolveNativeMode(owningTopology) {
+		envs = append(
+			envs,
+			k8scorev1.EnvVar{
+				Name:  "CLABERNETES_NATIVE_MODE",
+				Value: clabernetesconstants.True,
+			},
+		)
+	}
+
 	if ResolveGlobalVsTopologyBool(
 		r.configManagerGetter().GetContainerlabDebug(),
 		owningTopology.Spec.Deployment.ContainerlabDebug,
@@ -901,7 +1065,7 @@ func (r *DeploymentReconciler) renderDeploymentContainerEnv( //nolint: funlen
 		)
 	}
 
-	deployment.Spec.Template.Spec.Containers[0].Env = envs
+	r.getLauncherContainer(deployment).Env = envs
 }
 
 func (r *DeploymentReconciler) renderDeploymentContainerResources(
@@ -912,14 +1076,14 @@ func (r *DeploymentReconciler) renderDeploymentContainerResources(
 ) {
 	nodeResources, nodeResourcesOk := owningTopology.Spec.Deployment.Resources[nodeName]
 	if nodeResourcesOk {
-		deployment.Spec.Template.Spec.Containers[0].Resources = nodeResources
+		r.getLauncherContainer(deployment).Resources = nodeResources
 
 		return
 	}
 
 	defaultResources, defaultResourcesOk := owningTopology.Spec.Deployment.Resources[clabernetesconstants.Default] //nolint:lll
 	if defaultResourcesOk {
-		deployment.Spec.Template.Spec.Containers[0].Resources = defaultResources
+		r.getLauncherContainer(deployment).Resources = defaultResources
 
 		return
 	}
@@ -929,7 +1093,7 @@ func (r *DeploymentReconciler) renderDeploymentContainerResources(
 	)
 
 	if resources != nil {
-		deployment.Spec.Template.Spec.Containers[0].Resources = *resources
+		r.getLauncherContainer(deployment).Resources = *resources
 	}
 }
 
@@ -958,9 +1122,11 @@ func (r *DeploymentReconciler) renderDeploymentContainerPrivileges(
 		r.configManagerGetter().GetPrivilegedLauncher(),
 		owningTopology.Spec.Deployment.PrivilegedLauncher,
 	) {
-		deployment.Spec.Template.Spec.Containers[0].SecurityContext = &k8scorev1.SecurityContext{
-			Privileged: clabernetesutil.ToPointer(true),
-			RunAsUser:  clabernetesutil.ToPointer(int64(0)),
+		for i := range deployment.Spec.Template.Spec.Containers {
+			deployment.Spec.Template.Spec.Containers[i].SecurityContext = &k8scorev1.SecurityContext{
+				Privileged: clabernetesutil.ToPointer(true),
+				RunAsUser:  clabernetesutil.ToPointer(int64(0)),
+			}
 		}
 
 		return
@@ -973,64 +1139,57 @@ func (r *DeploymentReconciler) renderDeploymentContainerPrivileges(
 		"%s/%s", "container.apparmor.security.beta.kubernetes.io", nodeName,
 	)] = "unconfined"
 
-	deployment.Spec.Template.Spec.Containers[0].SecurityContext = &k8scorev1.SecurityContext{
-		Privileged: clabernetesutil.ToPointer(false),
-		RunAsUser:  clabernetesutil.ToPointer(int64(0)),
-		Capabilities: &k8scorev1.Capabilities{
-			Add: []k8scorev1.Capability{
-				// docker says we need these ones:
-				// https://github.com/moby/moby/blob/master/oci/caps/defaults.go#L6-L19
-				"CHOWN",
-				"DAC_OVERRIDE",
-				"FSETID",
-				"FOWNER",
-				"MKNOD",
-				"NET_RAW",
-				"SETGID",
-				"SETUID",
-				"SETFCAP",
-				"SETPCAP",
-				"NET_BIND_SERVICE",
-				"SYS_CHROOT",
-				"KILL",
-				"AUDIT_WRITE",
-				// docker doesnt say we need this but surely we do otherwise cant connect to
-				// daemon
-				"NET_ADMIN",
-				// cant untar/load image w/out this it seems
-				// https://github.com/moby/moby/issues/43086
-				"SYS_ADMIN",
-				// this it seems we need otherwise we get some issues finding child pid of
-				// containers and when we "docker run" it craps out
-				"SYS_RESOURCE",
-				// and some more that we needed to boot srl
-				"LINUX_IMMUTABLE",
-				"SYS_BOOT",
-				"SYS_TIME",
-				"SYS_MODULE",
-				"SYS_RAWIO",
-				"SYS_PTRACE",
-				// and some more that we need to run xdp lc manager in srl, and probably others!?
-				"SYS_NICE",
-				"IPC_LOCK",
-				// the rest for convenience of adding more later if needed
-				// "MAC_OVERRIDE",
-				// "MAC_ADMIN",
-				// "BPF",
-				// "PERFMON",
-				// "NET_BROADCAST",
-				// "DAC_READ_SEARCH",
-				// "SYSLOG",
-				// "WAKE_ALARM",
-				// "BLOCK_SUSPEND",
-				// "AUDIT_READ",
-				// "LEASE",
-				// "CHECKPOINT_RESTORE",
-				// "SYS_TTY_CONFIG",
-				// "SYS_PACCT",
-				// "IPC_OWNER",
+	// if native mode is enabled, we also need to set the sidecar as unconfined
+	if ResolveNativeMode(owningTopology) {
+		deployment.ObjectMeta.Annotations[fmt.Sprintf(
+			"%s/%s", "container.apparmor.security.beta.kubernetes.io", "clabernetes-launcher",
+		)] = "unconfined"
+	}
+
+	for i := range deployment.Spec.Template.Spec.Containers {
+		deployment.Spec.Template.Spec.Containers[i].SecurityContext = &k8scorev1.SecurityContext{
+			Privileged: clabernetesutil.ToPointer(false),
+			RunAsUser:  clabernetesutil.ToPointer(int64(0)),
+			Capabilities: &k8scorev1.Capabilities{
+				Add: []k8scorev1.Capability{
+					// docker says we need these ones:
+					// https://github.com/moby/moby/blob/master/oci/caps/defaults.go#L6-L19
+					"CHOWN",
+					"DAC_OVERRIDE",
+					"FSETID",
+					"FOWNER",
+					"MKNOD",
+					"NET_RAW",
+					"SETGID",
+					"SETUID",
+					"SETFCAP",
+					"SETPCAP",
+					"NET_BIND_SERVICE",
+					"SYS_CHROOT",
+					"KILL",
+					"AUDIT_WRITE",
+					// docker doesnt say we need this but surely we do otherwise cant connect to
+					// daemon
+					"NET_ADMIN",
+					// cant untar/load image w/out this it seems
+					// https://github.com/moby/moby/issues/43086
+					"SYS_ADMIN",
+					// this it seems we need otherwise we get some issues finding child pid of
+					// containers and when we "docker run" it craps out
+					"SYS_RESOURCE",
+					// and some more that we needed to boot srl
+					"LINUX_IMMUTABLE",
+					"SYS_BOOT",
+					"SYS_TIME",
+					"SYS_MODULE",
+					"SYS_RAWIO",
+					"SYS_PTRACE",
+					// and some more that we need to run xdp lc manager in srl, and probably others!?
+					"SYS_NICE",
+					"IPC_LOCK",
+				},
 			},
-		},
+		}
 	}
 }
 
@@ -1070,7 +1229,7 @@ func (r *DeploymentReconciler) renderDeploymentContainerStatus(
 
 	// startup probe delays the start of the readiness probe -- this gives us time for the nos to
 	// boot before we start doing the readiness check on the (slightly) faster frequency
-	deployment.Spec.Template.Spec.Containers[0].StartupProbe = &k8scorev1.Probe{
+	r.getLauncherContainer(deployment).StartupProbe = &k8scorev1.Probe{
 		ProbeHandler: k8scorev1.ProbeHandler{
 			Exec: &k8scorev1.ExecAction{
 				Command: []string{
@@ -1089,7 +1248,7 @@ func (r *DeploymentReconciler) renderDeploymentContainerStatus(
 
 	// after the startup probe has done its thing we set run the readiness probe -- since the
 	// launcher doenst check the status super frequently we keep this pretty slow too
-	deployment.Spec.Template.Spec.Containers[0].ReadinessProbe = &k8scorev1.Probe{
+	r.getLauncherContainer(deployment).ReadinessProbe = &k8scorev1.Probe{
 		ProbeHandler: k8scorev1.ProbeHandler{
 			Exec: &k8scorev1.ExecAction{
 				Command: []string{
@@ -1141,8 +1300,8 @@ func (r *DeploymentReconciler) renderDeploymentContainerStatus(
 		}
 	}
 
-	deployment.Spec.Template.Spec.Containers[0].Env = append(
-		deployment.Spec.Template.Spec.Containers[0].Env,
+	r.getLauncherContainer(deployment).Env = append(
+		r.getLauncherContainer(deployment).Env,
 		probeEnvVars...,
 	)
 }
@@ -1194,8 +1353,8 @@ func (r *DeploymentReconciler) renderDeploymentDevices(
 	)
 
 	// then mount them in our container (launchers (for now?!) only ever have the one container)
-	deployment.Spec.Template.Spec.Containers[0].VolumeMounts = append(
-		deployment.Spec.Template.Spec.Containers[0].VolumeMounts,
+	r.getLauncherContainer(deployment).VolumeMounts = append(
+		r.getLauncherContainer(deployment).VolumeMounts,
 		[]k8scorev1.VolumeMount{
 			{
 				Name:      "dev-kvm",
@@ -1241,8 +1400,8 @@ func (r *DeploymentReconciler) renderDeploymentPersistence(
 		},
 	)
 
-	deployment.Spec.Template.Spec.Containers[0].VolumeMounts = append(
-		deployment.Spec.Template.Spec.Containers[0].VolumeMounts,
+	r.getLauncherContainer(deployment).VolumeMounts = append(
+		r.getLauncherContainer(deployment).VolumeMounts,
 		k8scorev1.VolumeMount{
 			Name:      volumeName,
 			ReadOnly:  false,

@@ -28,19 +28,19 @@ func daemonConfigExists() bool {
 	return err == nil
 }
 
-func handleInsecureRegistries() error {
+func handleDockerDaemonConfig() error {
 	insecureRegistries := os.Getenv(clabernetesconstants.LauncherInsecureRegistries)
 
-	if insecureRegistries == "" {
-		return nil
-	}
+	var quotedRegistries []string
 
-	splitRegistries := strings.Split(insecureRegistries, ",")
+	if insecureRegistries != "" {
+		splitRegistries := strings.Split(insecureRegistries, ",")
 
-	quotedRegistries := make([]string, len(splitRegistries))
+		quotedRegistries = make([]string, len(splitRegistries))
 
-	for idx, elem := range splitRegistries {
-		quotedRegistries[idx] = fmt.Sprintf("%q", elem)
+		for idx, elem := range splitRegistries {
+			quotedRegistries[idx] = fmt.Sprintf("%q", elem)
+		}
 	}
 
 	templateVars := struct {
@@ -55,7 +55,7 @@ func handleInsecureRegistries() error {
 	// be much more efficient size-wise if not also perofrmance-wise; this *does* assume
 	// the hosts kernel supports overlayfs but that *should* be true almost everywhere at
 	// this point in time... i hope :P
-	if !strings.EqualFold(
+	if strings.EqualFold(
 		os.Getenv(clabernetesconstants.LauncherPrivilegedEnv),
 		clabernetesconstants.True,
 	) {

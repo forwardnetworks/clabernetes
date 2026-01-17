@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.18.0
+    controller-gen.kubebuilder.io/version: v0.16.5
   name: topologies.clabernetes.containerlab.dev
 spec:
   group: clabernetes.containerlab.dev
@@ -57,10 +57,11 @@ spec:
                   Connectivity defines the type of connectivity to use between nodes in the topology. The
                   default behavior is to use vxlan tunnels, alternatively you can enable a more experimental
                   "slurpeeth" connectivity flavor that stuffs traffic into tcp tunnels to avoid any vxlan mtu
-                  and/or fragmentation challenges.
+                  and/or fragmentation challenges, or "multus" to use multus cni for connectivity.
                 enum:
                 - vxlan
                 - slurpeeth
+                - multus
                 type: string
               definition:
                 description: |-
@@ -330,6 +331,10 @@ spec:
                       on a launcher node that the file should be downloaded to. This is useful for configs that are
                       larger than the ConfigMap (etcd) 1Mb size limit.
                     type: object
+                  hostNetwork:
+                    description: HostNetwork, when true, sets the pod to use the host
+                      network.
+                    type: boolean
                   launcherImage:
                     description: |-
                       LauncherImage sets the default launcher image to use when spawning launcher deployments for
@@ -359,6 +364,11 @@ spec:
                     - info
                     - debug
                     type: string
+                  nativeMode:
+                    description: |-
+                      NativeMode, when true, tells clabernetes to attempt to run the node image directly as a
+                      container in the pod rather than inside a docker-in-docker setup. This is experimental!
+                    type: boolean
                   persistence:
                     description: |-
                       Persistence holds configurations relating to persisting each nodes working containerlab
