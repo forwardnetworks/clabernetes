@@ -52,6 +52,7 @@ type Reconciler struct {
 func NewReconciler(
 	log claberneteslogging.Instance,
 	client ctrlruntimeclient.Client,
+	reader ctrlruntimeclient.Reader,
 	managerAppName,
 	managerNamespace,
 	criKind string,
@@ -63,6 +64,7 @@ func NewReconciler(
 		serviceAccountReconciler: NewServiceAccountReconciler(
 			log,
 			client,
+			reader,
 			configManagerGetter,
 		),
 		roleBindingReconciler: NewRoleBindingReconciler(

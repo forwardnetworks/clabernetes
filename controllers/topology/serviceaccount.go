@@ -27,6 +27,7 @@ func launcherServiceAccountName() string {
 type ServiceAccountReconciler struct {
 	log                 claberneteslogging.Instance
 	client              ctrlruntimeclient.Client
+	reader              ctrlruntimeclient.Reader
 	configManagerGetter clabernetesconfig.ManagerGetterFunc
 }
 
@@ -34,11 +35,17 @@ type ServiceAccountReconciler struct {
 func NewServiceAccountReconciler(
 	log claberneteslogging.Instance,
 	client ctrlruntimeclient.Client,
+	reader ctrlruntimeclient.Reader,
 	configManagerGetter clabernetesconfig.ManagerGetterFunc,
 ) *ServiceAccountReconciler {
+	if reader == nil {
+		reader = client
+	}
+
 	return &ServiceAccountReconciler{
 		log:                 log,
 		client:              client,
+		reader:              reader,
 		configManagerGetter: configManagerGetter,
 	}
 }
@@ -184,7 +191,7 @@ func (r *ServiceAccountReconciler) reconcileGetAndCreateIfNotExist( //nolint:dup
 
 	existingServiceAccount := &k8scorev1.ServiceAccount{}
 
-	err := r.client.Get(
+	err := r.reader.Get(
 		ctx,
 		apimachinerytypes.NamespacedName{
 			Namespace: namespace,
@@ -221,7 +228,7 @@ func (r *ServiceAccountReconciler) reconcileGetAndCreateIfNotExist( //nolint:dup
 			if apimachineryerrors.IsAlreadyExists(err) {
 				// A race (informer cache staleness, concurrent creator, etc.) can surface as NotFound
 				// followed by AlreadyExists. Treat this as success and return the existing object.
-				getErr := r.client.Get(
+				getErr := r.reader.Get(
 					ctx,
 					apimachinerytypes.NamespacedName{
 						Namespace: namespace,

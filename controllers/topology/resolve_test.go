@@ -135,6 +135,7 @@ func TestReconcileResolveDeployment(t *testing.T) {
 				r := clabernetescontrollerstopology.NewReconciler(
 					&claberneteslogging.FakeInstance{},
 					fakeClient,
+					fakeClient,
 					"clabernetes",
 					"clabernetes",
 					"containerd",
@@ -293,6 +294,7 @@ func TestReconcileResolvePVC(t *testing.T) {
 
 				r := clabernetescontrollerstopology.NewReconciler(
 					&claberneteslogging.FakeInstance{},
+					fakeClient,
 					fakeClient,
 					"clabernetes",
 					"clabernetes",
@@ -458,6 +460,7 @@ func TestReconcileResolveServiceFabric(t *testing.T) {
 				r := clabernetescontrollerstopology.NewReconciler(
 					&claberneteslogging.FakeInstance{},
 					fakeClient,
+					fakeClient,
 					"clabernetes",
 					"clabernetes",
 					"containerd",
@@ -621,6 +624,7 @@ func TestReconcileResolveServiceExpose(t *testing.T) {
 
 				r := clabernetescontrollerstopology.NewReconciler(
 					&claberneteslogging.FakeInstance{},
+					fakeClient,
 					fakeClient,
 					"clabernetes",
 					"clabernetes",
