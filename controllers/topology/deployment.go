@@ -776,6 +776,26 @@ func (r *DeploymentReconciler) renderDeploymentContainer(
 		ImagePullPolicy:          k8scorev1.PullPolicy(imagePullPolicy),
 	}
 
+	// Best-effort support for common containerlab node overrides when running in native mode.
+	// For linux-based nodes, `cmd:` in the topology is commonly used (for example `sleep infinity`).
+	if nodeDef, ok := clabernetesConfigs[nodeName].Topology.Nodes[nodeName]; ok {
+		if len(nodeDef.Env) > 0 {
+			for k, v := range nodeDef.Env {
+				nosContainer.Env = append(
+					nosContainer.Env,
+					k8scorev1.EnvVar{Name: k, Value: v},
+				)
+			}
+			slices.SortFunc(nosContainer.Env, func(a, b k8scorev1.EnvVar) int { return strings.Compare(a.Name, b.Name) })
+		}
+
+		if strings.TrimSpace(nodeDef.Cmd) != "" {
+			nosContainer.Command = []string{"sh", "-c", nodeDef.Cmd}
+		} else if strings.TrimSpace(nodeDef.Entrypoint) != "" {
+			nosContainer.Command = []string{"sh", "-c", nodeDef.Entrypoint}
+		}
+	}
+
 	deployment.Spec.Template.Spec.Containers = []k8scorev1.Container{nosContainer, launcherContainer}
 }
 
