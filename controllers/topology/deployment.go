@@ -999,7 +999,7 @@ func (r *DeploymentReconciler) renderDeploymentContainerEnv( //nolint: funlen
 		envs = append(
 			envs,
 			k8scorev1.EnvVar{
-				Name:  "CLABERNETES_NATIVE_MODE",
+				Name:  clabernetesconstants.LauncherNativeModeEnv,
 				Value: clabernetesconstants.True,
 			},
 		)
