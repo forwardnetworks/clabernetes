@@ -1066,6 +1066,11 @@ func (r *DeploymentReconciler) renderDeploymentContainerEnv( //nolint: funlen
 	}
 
 	r.getLauncherContainer(deployment).Env = envs
+	for i := range deployment.Spec.Template.Spec.InitContainers {
+		if deployment.Spec.Template.Spec.InitContainers[i].Name == "clabernetes-setup" {
+			deployment.Spec.Template.Spec.InitContainers[i].Env = envs
+		}
+	}
 }
 
 func (r *DeploymentReconciler) renderDeploymentContainerResources(
