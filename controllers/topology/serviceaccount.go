@@ -158,7 +158,7 @@ func (r *ServiceAccountReconciler) Conforms(
 	}
 
 	// we need to check to make sure that *at least* our topology exists as an owner for this
-	if len(existingServiceAccount.ObjectMeta.OwnerReferences) == 1 {
+	if len(existingServiceAccount.ObjectMeta.OwnerReferences) < 1 {
 		// we should have *at least* one owner reference
 		return false
 	}
