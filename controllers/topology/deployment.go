@@ -789,6 +789,57 @@ func (r *DeploymentReconciler) renderDeploymentContainer(
 			slices.SortFunc(nosContainer.Env, func(a, b k8scorev1.EnvVar) int { return strings.Compare(a.Name, b.Name) })
 		}
 
+		// systemd-based NOS images often require writable tmpfs mounts.
+		// In containerlab/Docker mode these are commonly configured by containerlab runtime flags;
+		// in native mode we must provide them as Kubernetes volumes.
+		if strings.EqualFold(nodeDef.Kind, "ceos") {
+			existingMounts := map[string]struct{}{}
+			for _, vm := range nosContainer.VolumeMounts {
+				existingMounts[strings.TrimSpace(vm.MountPath)] = struct{}{}
+			}
+			existingVolumes := map[string]struct{}{}
+			for _, v := range deployment.Spec.Template.Spec.Volumes {
+				existingVolumes[v.Name] = struct{}{}
+			}
+
+			addEmptyDir := func(volName, mountPath string, medium k8scorev1.StorageMedium) {
+				volName = strings.TrimSpace(volName)
+				mountPath = strings.TrimSpace(mountPath)
+				if volName == "" || mountPath == "" {
+					return
+				}
+				if _, ok := existingMounts[mountPath]; ok {
+					return
+				}
+				if _, ok := existingVolumes[volName]; !ok {
+					deployment.Spec.Template.Spec.Volumes = append(
+						deployment.Spec.Template.Spec.Volumes,
+						k8scorev1.Volume{
+							Name: volName,
+							VolumeSource: k8scorev1.VolumeSource{
+								EmptyDir: &k8scorev1.EmptyDirVolumeSource{
+									Medium: medium,
+								},
+							},
+						},
+					)
+					existingVolumes[volName] = struct{}{}
+				}
+				nosContainer.VolumeMounts = append(
+					nosContainer.VolumeMounts,
+					k8scorev1.VolumeMount{
+						Name:      volName,
+						MountPath: mountPath,
+					},
+				)
+				existingMounts[mountPath] = struct{}{}
+			}
+
+			addEmptyDir("systemd-run", "/run", k8scorev1.StorageMediumMemory)
+			addEmptyDir("systemd-runlock", "/run/lock", k8scorev1.StorageMediumMemory)
+			addEmptyDir("systemd-tmp", "/tmp", k8scorev1.StorageMediumMemory)
+		}
+
 		// Best-effort support for bind mounts in native mode.
 		//
 		// In "classic" (non-native) mode, containerlab/Docker handles common node requirements for
