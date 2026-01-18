@@ -135,13 +135,31 @@ func (r *ServiceAccountReconciler) Render(
 		},
 	}
 
+	// If the topology specifies pull secrets, apply them as Kubernetes imagePullSecrets so
+	// the launcher (and init) images can be pulled in clusters where the registry is private.
+	if len(owningTopology.Spec.ImagePull.PullSecrets) > 0 {
+		renderedServiceAccount.ImagePullSecrets = make([]k8scorev1.LocalObjectReference, 0, len(owningTopology.Spec.ImagePull.PullSecrets))
+		for _, name := range owningTopology.Spec.ImagePull.PullSecrets {
+			if name == "" {
+				continue
+			}
+			renderedServiceAccount.ImagePullSecrets = append(
+				renderedServiceAccount.ImagePullSecrets,
+				k8scorev1.LocalObjectReference{Name: name},
+			)
+		}
+	}
+
 	// when we render we want to include any existing owner references as rolebindings (and sa) are
 	// owned by all topologies in a given namespace, so make sure to retain those
 	if existingServieAccount != nil {
 		renderedServiceAccount.OwnerReferences = existingServieAccount.GetOwnerReferences()
-		// Preserve any pre-provisioned pull secrets (for private launcher images) and any other
-		// secrets fields that might be managed externally.
-		renderedServiceAccount.ImagePullSecrets = existingServieAccount.ImagePullSecrets
+		// Preserve any pre-provisioned pull secrets (for private launcher images) when the
+		// topology didn't explicitly specify secrets, and preserve any other secrets fields that
+		// might be managed externally.
+		if len(renderedServiceAccount.ImagePullSecrets) == 0 {
+			renderedServiceAccount.ImagePullSecrets = existingServieAccount.ImagePullSecrets
+		}
 		renderedServiceAccount.Secrets = existingServieAccount.Secrets
 	}
 
