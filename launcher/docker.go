@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"text/template"
 	"time"
@@ -71,6 +72,10 @@ func handleDockerDaemonConfig() error {
 
 	err = t.Execute(&rendered, templateVars)
 	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(dockerDaemonConfig), 0o755); err != nil {
 		return err
 	}
 
