@@ -36,6 +36,7 @@ RUN apt-get update && \
     jq \
     iproute2 \
     iptables \
+    docker.io \
     tcpdump \
     procps \
     ethtool \

@@ -113,6 +113,7 @@ func enableLegacyIPTables(ctx context.Context, logger io.Writer) error {
 
 func startDocker(ctx context.Context, logger io.Writer) error {
 	var attempts int
+	var dockerdStarted bool
 
 	for {
 		psCmd := exec.CommandContext(ctx, "docker", "ps")
@@ -137,13 +138,39 @@ func startDocker(ctx context.Context, logger io.Writer) error {
 
 		err = startCmd.Run()
 		if err != nil {
-			return err
+			// In minimal container images there may be no init scripts; start dockerd directly.
+			// We attempt this once and then fall back to retrying `docker ps`.
+			if !dockerdStarted {
+				dockerdStarted = true
+				if derr := startDockerDaemon(logger); derr != nil {
+					return err
+				}
+			} else {
+				return err
+			}
 		}
 
 		time.Sleep(time.Second)
 
 		attempts++
 	}
+}
+
+func startDockerDaemon(logger io.Writer) error {
+	if _, err := exec.LookPath("dockerd"); err != nil {
+		return err
+	}
+
+	// Start dockerd in the background. The launcher process stays alive for the pod lifetime, so
+	// we keep dockerd as a child and reap it if it exits.
+	cmd := exec.Command("dockerd", "--host=unix:///var/run/docker.sock") //nolint:gosec
+	cmd.Stdout = logger
+	cmd.Stderr = logger
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	go func() { _ = cmd.Wait() }()
+	return nil
 }
 
 func getContainerIDs(ctx context.Context, all bool) ([]string, error) {
