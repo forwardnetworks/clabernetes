@@ -20,6 +20,7 @@ import (
 	apimachinerymeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	apimachinerytypes "k8s.io/apimachinery/pkg/types"
 	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlruntimeutil "sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -953,11 +954,24 @@ func (r *Reconciler) ReconcileNetworkAttachmentDefinitions(
 
 	nadTypeName := "network-attachment-definition"
 
+	// NOTE: controller-runtime requires Unstructured objects/lists to have GVK set for List operations.
+	nadGVK := schema.GroupVersionKind{Group: "k8s.cni.cncf.io", Version: "v1", Kind: "NetworkAttachmentDefinition"}
+	nad := &unstructured.Unstructured{}
+	nad.SetGroupVersionKind(nadGVK)
+	nadList := &unstructured.UnstructuredList{}
+	nadList.SetGroupVersionKind(schema.GroupVersionKind{Group: nadGVK.Group, Version: nadGVK.Version, Kind: "NetworkAttachmentDefinitionList"})
+	// Some controller-runtime versions also require apiVersion/kind present in the backing object map.
+	if nadList.Object == nil {
+		nadList.Object = map[string]any{}
+	}
+	nadList.Object["apiVersion"] = nadGVK.Group + "/" + nadGVK.Version
+	nadList.Object["kind"] = "NetworkAttachmentDefinitionList"
+
 	nads, err := ReconcileResolve(
 		ctx,
 		r,
-		&unstructured.Unstructured{},
-		&unstructured.UnstructuredList{},
+		nad,
+		nadList,
 		nadTypeName,
 		owningTopology,
 		reconcileData.ResolvedConfigs,
