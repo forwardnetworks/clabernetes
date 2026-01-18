@@ -186,6 +186,25 @@ func (r *ServiceAccountReconciler) Conforms(
 		return false
 	}
 
+	// If we expect image pull secrets, ensure the existing service account contains them.
+	if len(renderedServiceAccount.ImagePullSecrets) > 0 {
+		existing := make(map[string]struct{}, len(existingServiceAccount.ImagePullSecrets))
+		for _, s := range existingServiceAccount.ImagePullSecrets {
+			if s.Name == "" {
+				continue
+			}
+			existing[s.Name] = struct{}{}
+		}
+		for _, s := range renderedServiceAccount.ImagePullSecrets {
+			if s.Name == "" {
+				continue
+			}
+			if _, ok := existing[s.Name]; !ok {
+				return false
+			}
+		}
+	}
+
 	// we need to check to make sure that *at least* our topology exists as an owner for this
 	if len(existingServiceAccount.ObjectMeta.OwnerReferences) < 1 {
 		// we should have *at least* one owner reference
