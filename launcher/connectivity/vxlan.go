@@ -125,6 +125,19 @@ func (m *vxlanManager) runContainerlabVxlanToolsCreate(
 		)
 	}
 
+	// In docker-mode, containerlab creates a veth pair per endpoint and names the "host side" of the
+	// veth `<node>-<ifname>` (e.g. `forti1-eth1`) which the vxlan tools then attach to.
+	//
+	// In native-mode, we run the NOS container directly as a k8s container (no Docker-in-Docker),
+	// so there is no containerlab veth wiring step that would normally create this link.
+	//
+	// Since all containers in a pod share the same network namespace, we can create the expected veth
+	// pair in the pod netns: `<node>-<ifname>` <-> `<ifname>`.
+	err = m.ensurePodLinkExists(m.ctx, localNodeName, cntLink)
+	if err != nil {
+		return err
+	}
+
 	cmd := exec.CommandContext( //nolint:gosec
 		m.ctx,
 		"containerlab",
@@ -151,6 +164,66 @@ func (m *vxlanManager) runContainerlabVxlanToolsCreate(
 	err = cmd.Run()
 	if err != nil {
 		return err
+	}
+
+	return nil
+}
+
+func (m *vxlanManager) ensurePodLinkExists(
+	ctx context.Context,
+	localNodeName string,
+	cntLink string,
+) error {
+	hostSide := fmt.Sprintf("%s-%s", localNodeName, cntLink)
+
+	// If the host-side link already exists, we're done.
+	checkCmd := exec.CommandContext(ctx, "ip", "link", "show", hostSide) //nolint:gosec
+	if err := checkCmd.Run(); err == nil {
+		return nil
+	}
+
+	// If the container-side link exists, we shouldn't clobber it.
+	checkCntCmd := exec.CommandContext(ctx, "ip", "link", "show", cntLink) //nolint:gosec
+	if err := checkCntCmd.Run(); err == nil {
+		return fmt.Errorf(
+			"%w: expected vxlan link %q missing but interface %q already exists",
+			claberneteserrors.ErrConnectivity,
+			hostSide,
+			cntLink,
+		)
+	}
+
+	// Create veth pair and bring it up.
+	addCmd := exec.CommandContext( //nolint:gosec
+		ctx,
+		"ip",
+		"link",
+		"add",
+		hostSide,
+		"type",
+		"veth",
+		"peer",
+		"name",
+		cntLink,
+	)
+	addCmd.Stdout = m.logger
+	addCmd.Stderr = m.logger
+	if err := addCmd.Run(); err != nil {
+		return fmt.Errorf("%w: failed creating veth %q <-> %q: %s", claberneteserrors.ErrConnectivity, hostSide, cntLink, err)
+	}
+
+	upHostCmd := exec.CommandContext(ctx, "ip", "link", "set", hostSide, "up") //nolint:gosec
+	upHostCmd.Stdout = m.logger
+	upHostCmd.Stderr = m.logger
+	if err := upHostCmd.Run(); err != nil {
+		return fmt.Errorf("%w: failed bringing up %q: %s", claberneteserrors.ErrConnectivity, hostSide, err)
+	}
+
+	upCntCmd := exec.CommandContext(ctx, "ip", "link", "set", cntLink, "up") //nolint:gosec
+	upCntCmd.Stdout = m.logger
+	upCntCmd.Stderr = m.logger
+	if err := upCntCmd.Run(); err != nil {
+		return fmt.Errorf("%w: failed bringing up %q: %s", claberneteserrors.ErrConnectivity, cntLink, err)
 	}
 
 	return nil
