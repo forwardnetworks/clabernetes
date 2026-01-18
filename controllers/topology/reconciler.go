@@ -780,7 +780,14 @@ func (r *Reconciler) ReconcileDeployments( //nolint: gocyclo,funlen
 	r.Log.Info("processing deployment statuses")
 
 	for nodeName, deployment := range deployments.Current {
-		if deployment.Status.ReadyReplicas == 1 {
+		ready := deployment.Status.ReadyReplicas == 1
+		if !ready {
+			// Some Kubernetes distributions/versions may omit Deployment.Status replica counters
+			// even when the underlying Pod is Ready. Fall back to checking the Pod Ready condition.
+			ready = r.isNodePodReady(ctx, owningTopology, nodeName)
+		}
+
+		if ready {
 			reconcileData.NodeStatuses[nodeName] = clabernetesconstants.NodeStatusReady
 		} else {
 			reconcileData.NodeStatuses[nodeName] = clabernetesconstants.NodeStatusNotReady //nolint:lll
@@ -1041,6 +1048,41 @@ func (r *Reconciler) ReconcileNetworkAttachmentDefinitions(
 	}
 
 	return nil
+}
+
+func (r *Reconciler) isNodePodReady(
+	ctx context.Context,
+	owningTopology *clabernetesapisv1alpha1.Topology,
+	nodeName string,
+) bool {
+	if owningTopology == nil {
+		return false
+	}
+
+	pods := &k8scorev1.PodList{}
+	err := r.Client.List(
+		ctx,
+		pods,
+		ctrlruntimeclient.InNamespace(owningTopology.GetNamespace()),
+		ctrlruntimeclient.MatchingLabels{
+			clabernetesconstants.LabelTopologyOwner: owningTopology.GetName(),
+			clabernetesconstants.LabelTopologyNode:  nodeName,
+		},
+	)
+	if err != nil {
+		return false
+	}
+
+	for i := range pods.Items {
+		for j := range pods.Items[i].Status.Conditions {
+			cond := pods.Items[i].Status.Conditions[j]
+			if cond.Type == k8scorev1.PodReady && cond.Status == k8scorev1.ConditionTrue {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 func (r *Reconciler) diffIfDebug(a, b any) {
