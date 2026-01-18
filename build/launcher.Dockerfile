@@ -25,6 +25,8 @@ FROM debian:bookworm-slim
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
+ARG CONTAINERLAB_VERSION=0.72.0
+
 RUN apt-get update && \
     apt-get install -yq --no-install-recommends \
     ca-certificates \
@@ -40,6 +42,13 @@ RUN apt-get update && \
     openssh-client \
     inetutils-ping \
     traceroute
+
+# Install containerlab CLI (used for connectivity helpers like VXLAN).
+RUN curl -fsSL -o /tmp/containerlab.tgz \
+      "https://github.com/srl-labs/containerlab/releases/download/v${CONTAINERLAB_VERSION}/containerlab_${CONTAINERLAB_VERSION}_Linux_amd64.tar.gz" && \
+    tar -C /usr/local/bin -xzf /tmp/containerlab.tgz containerlab && \
+    chmod +x /usr/local/bin/containerlab && \
+    rm -f /tmp/containerlab.tgz
 RUN apt-get clean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* /var/cache/apt/archive/*.deb
 
