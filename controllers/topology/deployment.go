@@ -999,6 +999,19 @@ func (r *DeploymentReconciler) renderDeploymentNative(
 		return
 	}
 
+	// When ShareProcessNamespace is enabled, the "native" NOS container may not end up as PID 1.
+	// Systemd-based NOS images (like Arista cEOS) require being PID 1 and will crash otherwise.
+	//
+	// Disable process namespace sharing for these nodes while still allowing native mode.
+	if clabernetesConfigs != nil && clabernetesConfigs[nodeName] != nil {
+		if node, ok := clabernetesConfigs[nodeName].Topology.Nodes[nodeName]; ok {
+			switch node.Kind {
+			case "ceos", "eos":
+				deployment.Spec.Template.Spec.ShareProcessNamespace = nil
+			}
+		}
+	}
+
 	launcherContainer := r.getLauncherContainer(deployment)
 
 	initContainer := launcherContainer.DeepCopy()
