@@ -789,6 +789,84 @@ func (r *DeploymentReconciler) renderDeploymentContainer(
 			slices.SortFunc(nosContainer.Env, func(a, b k8scorev1.EnvVar) int { return strings.Compare(a.Name, b.Name) })
 		}
 
+		// Best-effort support for bind mounts in native mode.
+		//
+		// In "classic" (non-native) mode, containerlab/Docker handles common node requirements for
+		// network OSes. In native mode, the NOS runs as a Kubernetes container and relies on k8s
+		// volume mounts. We translate *absolute* host bind mounts into HostPath volumes.
+		if len(nodeDef.Binds) > 0 {
+			existingMounts := map[string]struct{}{}
+			for _, vm := range nosContainer.VolumeMounts {
+				existingMounts[strings.TrimSpace(vm.MountPath)] = struct{}{}
+			}
+			existingVolumes := map[string]struct{}{}
+			for _, v := range deployment.Spec.Template.Spec.Volumes {
+				existingVolumes[v.Name] = struct{}{}
+			}
+
+			for idx, bind := range nodeDef.Binds {
+				bind = strings.TrimSpace(bind)
+				if bind == "" {
+					continue
+				}
+				parts := strings.SplitN(bind, ":", 3)
+				if len(parts) < 2 {
+					continue
+				}
+				hostPath := strings.TrimSpace(parts[0])
+				containerPath := strings.TrimSpace(parts[1])
+				if hostPath == "" || containerPath == "" {
+					continue
+				}
+				// Only translate absolute host paths; relative binds are typically "node_files" and are
+				// handled via other clabernetes mechanisms.
+				if !strings.HasPrefix(hostPath, "/") {
+					continue
+				}
+				if _, ok := existingMounts[containerPath]; ok {
+					continue
+				}
+
+				readOnly := false
+				if len(parts) == 3 {
+					opts := strings.TrimSpace(parts[2])
+					if strings.Contains(opts, "ro") {
+						readOnly = true
+					}
+				}
+
+				volName := fmt.Sprintf("bind-%d", idx)
+				for i := 2; ; i++ {
+					if _, ok := existingVolumes[volName]; !ok {
+						break
+					}
+					volName = fmt.Sprintf("bind-%d-%d", idx, i)
+				}
+				existingVolumes[volName] = struct{}{}
+				existingMounts[containerPath] = struct{}{}
+
+				deployment.Spec.Template.Spec.Volumes = append(
+					deployment.Spec.Template.Spec.Volumes,
+					k8scorev1.Volume{
+						Name: volName,
+						VolumeSource: k8scorev1.VolumeSource{
+							HostPath: &k8scorev1.HostPathVolumeSource{
+								Path: hostPath,
+							},
+						},
+					},
+				)
+				nosContainer.VolumeMounts = append(
+					nosContainer.VolumeMounts,
+					k8scorev1.VolumeMount{
+						Name:      volName,
+						MountPath: containerPath,
+						ReadOnly:  readOnly,
+					},
+				)
+			}
+		}
+
 		if strings.TrimSpace(nodeDef.Cmd) != "" {
 			nosContainer.Command = []string{"sh", "-c", nodeDef.Cmd}
 		} else if strings.TrimSpace(nodeDef.Entrypoint) != "" {
