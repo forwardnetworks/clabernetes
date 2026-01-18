@@ -779,6 +779,22 @@ func (r *DeploymentReconciler) renderDeploymentContainer(
 	// Best-effort support for common containerlab node overrides when running in native mode.
 	// For linux-based nodes, `cmd:` in the topology is commonly used (for example `sleep infinity`).
 	if nodeDef, ok := clabernetesConfigs[nodeName].Topology.Nodes[nodeName]; ok {
+		if strings.EqualFold(nodeDef.Kind, "linux") {
+			cmd := strings.TrimSpace(nodeDef.Cmd)
+			if cmd == "" {
+				lc := strings.ToLower(strings.TrimSpace(nodeImage))
+				// Common netlab examples use python/alpine images for linux hosts. In Kubernetes,
+				// these can exit immediately when STDIN is not attached. Force a long-running
+				// command so the node stays up for exec/config steps.
+				if strings.Contains(lc, "python") || strings.Contains(lc, "alpine") {
+					cmd = "sleep infinity"
+				}
+			}
+			if cmd != "" {
+				nosContainer.Command = []string{"sh", "-c", cmd}
+			}
+		}
+
 		if len(nodeDef.Env) > 0 {
 			for k, v := range nodeDef.Env {
 				nosContainer.Env = append(
