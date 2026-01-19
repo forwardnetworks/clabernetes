@@ -1600,6 +1600,15 @@ func determineNodeNeedsRestart(
 	previousConfig := reconcileData.PreviousConfigs[nodeName]
 	currentConfig := reconcileData.ResolvedConfigs[nodeName]
 
+	// We store the "previous" configs in Topology status as YAML strings and
+	// unmarshal them on each reconcile. Depending on which keys were present in
+	// the YAML, slices/maps can legitimately round-trip as nil vs empty.
+	//
+	// Treat nil/empty collections as equivalent so we don't get stuck in a
+	// perpetual restart loop.
+	normalizeNilCollections(previousConfig)
+	normalizeNilCollections(currentConfig)
+
 	if previousConfig.Debug != currentConfig.Debug {
 		reconcileData.NodesNeedingReboot.Add(nodeName)
 
@@ -1665,5 +1674,62 @@ func determineNodeNeedsRestart(
 		reconcileData.NodesNeedingReboot.Add(nodeName)
 
 		return
+	}
+}
+
+func normalizeNilCollections(obj any) {
+	if obj == nil {
+		return
+	}
+
+	val := reflect.ValueOf(obj)
+	if val.Kind() != reflect.Pointer || val.IsNil() {
+		return
+	}
+
+	normalizeNilCollectionsValue(val.Elem())
+}
+
+func normalizeNilCollectionsValue(val reflect.Value) {
+	if !val.IsValid() {
+		return
+	}
+
+	switch val.Kind() {
+	case reflect.Pointer:
+		if val.IsNil() {
+			return
+		}
+		normalizeNilCollectionsValue(val.Elem())
+	case reflect.Interface:
+		if val.IsNil() {
+			return
+		}
+		normalizeNilCollectionsValue(val.Elem())
+	case reflect.Struct:
+		for i := 0; i < val.NumField(); i++ {
+			field := val.Field(i)
+
+			switch field.Kind() {
+			case reflect.Slice:
+				if field.IsNil() && field.CanSet() {
+					field.Set(reflect.MakeSlice(field.Type(), 0, 0))
+				}
+			case reflect.Map:
+				if field.IsNil() && field.CanSet() {
+					field.Set(reflect.MakeMap(field.Type()))
+				}
+			default:
+				normalizeNilCollectionsValue(field)
+			}
+		}
+	case reflect.Slice:
+		for i := 0; i < val.Len(); i++ {
+			normalizeNilCollectionsValue(val.Index(i))
+		}
+	case reflect.Map:
+		for _, key := range val.MapKeys() {
+			normalizeNilCollectionsValue(val.MapIndex(key))
+		}
 	}
 }
