@@ -4,8 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-
-	"gopkg.in/yaml.v3"
 )
 
 // HashBytes accepts a bytes object and returns a string sha256 hash representing that object.
@@ -28,7 +26,12 @@ func HashObject(o any) ([]byte, string, error) { //nolint:gocritic
 
 // HashObjectYAML accepts any object, dumps it to yaml then sends it to HashBytes.
 func HashObjectYAML(o any) ([]byte, string, error) { //nolint:gocritic
-	b, err := yaml.Marshal(o)
+	// NOTE: We intentionally marshal to JSON here.
+	//
+	// YAML serialization of Go maps is not stable (map iteration order), which causes
+	// flapping hashes and endless reconcile loops. JSON marshaling is stable (sorted
+	// map keys) and the output is valid YAML (YAML is a superset of JSON).
+	b, err := json.Marshal(o)
 	if err != nil {
 		return nil, "", err
 	}
