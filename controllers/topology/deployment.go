@@ -348,13 +348,25 @@ func (r *DeploymentReconciler) Conforms( //nolint: gocyclo
 func (r *DeploymentReconciler) DetermineNodesNeedingRestart(
 	reconcileData *ReconcileData,
 ) {
+	// When the rendered containerlab config changes, we have to restart nodes so
+	// the launcher realizes the updated config. Historically we tried to diff the
+	// unmarshaled config structs node-by-node, but because the "previous" configs
+	// are round-tripped through YAML (Topology status), benign serialization
+	// differences can cause endless restart loops.
+	//
+	// The config hash already captures real changes (and is stable), so use it as
+	// the gate for restarts and restart all existing nodes when it changes.
+	if reconcileData.PreviousHashes.Config == reconcileData.ResolvedHashes.Config {
+		return
+	}
+
 	for nodeName := range reconcileData.ResolvedConfigs {
 		_, nodeExistedBefore := reconcileData.PreviousConfigs[nodeName]
 		if !nodeExistedBefore {
 			continue
 		}
 
-		determineNodeNeedsRestart(reconcileData, nodeName)
+		reconcileData.NodesNeedingReboot.Add(nodeName)
 	}
 }
 
