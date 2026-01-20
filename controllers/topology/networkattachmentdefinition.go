@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 	"reflect"
 
 	clabernetesapisv1alpha1 "github.com/srl-labs/clabernetes/apis/v1alpha1"
@@ -25,6 +27,24 @@ func bridgeNameForNAD(nadName string) string {
 	// We want a deterministic name that won't collide, so we use a short hash.
 	sum := sha1.Sum([]byte(nadName))
 	return "br-" + hex.EncodeToString(sum[:])[:11] // 14 chars total
+}
+
+func linkSubnetForNAD(nadName string) string {
+	// Try to derive a deterministic /24 per link index to avoid duplicate IPs
+	// across multiple interfaces in the same pod.
+	//
+	// NAD names are expected to end with "-l<index>".
+	i := strings.LastIndex(nadName, "-l")
+	if i >= 0 && i+2 < len(nadName) {
+		if idx, err := strconv.Atoi(nadName[i+2:]); err == nil {
+			// 1..254 are safe /24 third-octets in 169.254.X.0/24
+			if idx >= 0 && idx <= 253 {
+				return fmt.Sprintf("169.254.%d.0/24", idx+1)
+			}
+		}
+	}
+	// Fallback: a wide link-local range (still isolated per bridge).
+	return "169.254.0.0/16"
 }
 
 // NetworkAttachmentDefinitionReconciler is a subcomponent of the "TopologyReconciler" but is
@@ -135,6 +155,7 @@ func (r *NetworkAttachmentDefinitionReconciler) Render(
 	// We use a short, deterministic bridge name to stay under the Linux 15-byte
 	// interface name limit.
 	bridgeName := bridgeNameForNAD(nadName)
+	subnet := linkSubnetForNAD(nadName)
 	config := map[string]any{
 		"cniVersion": "0.3.1",
 		"name":       nadName,
@@ -146,7 +167,7 @@ func (r *NetworkAttachmentDefinitionReconciler) Render(
 		"mtu":        9000,
 		"ipam": map[string]any{
 			"type":   "host-local",
-			"subnet": "169.254.0.0/16",
+			"subnet": subnet,
 			"routes": []map[string]any{},
 		},
 	}
