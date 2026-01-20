@@ -973,7 +973,9 @@ func (r *DeploymentReconciler) renderDeploymentMultus(
 		return
 	}
 
-	topologyName := owningTopology.Name
+	// Keep NAD naming consistent with NetworkAttachmentDefinitionReconciler.Resolve,
+	// which uses nodeConfig.Name as the link namespace prefix.
+	topologyName := nodeConfig.Name
 
 	var networkNames []string
 
