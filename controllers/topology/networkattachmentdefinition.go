@@ -1,6 +1,8 @@
 package topology
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -16,6 +18,14 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	apimachinerytypes "k8s.io/apimachinery/pkg/types"
 )
+
+func bridgeNameForNAD(nadName string) string {
+	// Linux interface names are limited to 15 bytes.
+	//
+	// We want a deterministic name that won't collide, so we use a short hash.
+	sum := sha1.Sum([]byte(nadName))
+	return "br-" + hex.EncodeToString(sum[:])[:11] // 14 chars total
+}
 
 // NetworkAttachmentDefinitionReconciler is a subcomponent of the "TopologyReconciler" but is
 // exposed for testing purposes. This is the component responsible for rendering/validating the
@@ -116,12 +126,29 @@ func (r *NetworkAttachmentDefinitionReconciler) Render(
 		labels[k] = v
 	}
 
-	// basic netkit config
+	// Basic L2 link config for Multus.
+	//
+	// NOTE: Cilium's "netkit" is a datapath mode (veth replacement) and does not
+	// provide a Multus CNI plugin called "netkit". For Multus attachments we use
+	// the standard CNI bridge plugin with host-local IPAM.
+	//
+	// We use a short, deterministic bridge name to stay under the Linux 15-byte
+	// interface name limit.
+	bridgeName := bridgeNameForNAD(nadName)
 	config := map[string]any{
 		"cniVersion": "0.3.1",
 		"name":       nadName,
-		"type":       "netkit",
-		"mode":       "ptp",
+		"type":       "bridge",
+		"bridge":     bridgeName,
+		"isGateway":  false,
+		"ipMasq":     false,
+		"hairpinMode": true,
+		"mtu":        9000,
+		"ipam": map[string]any{
+			"type":   "host-local",
+			"subnet": "169.254.0.0/16",
+			"routes": []map[string]any{},
+		},
 	}
 
 	configBytes, _ := json.Marshal(config)
