@@ -160,6 +160,14 @@ func (c *clabernetes) setupOnly() {
 	c.containerlabVersion()
 	c.setup()
 
+	// Cache tunnels during init-container setup so launch does not depend on Kubernetes API
+	// access from within the pod network namespace. Native-mode NOS containers can mutate
+	// routes on the shared pod netns, breaking access to the cluster Service CIDR.
+	err := c.cacheNodeTunnels()
+	if err != nil {
+		c.logger.Fatalf("failed caching tunnels content, err: %s", err)
+	}
+
 	c.logger.Info("clabernetes setup complete")
 
 	claberneteslogging.GetManager().Flush()
@@ -301,6 +309,9 @@ func (c *clabernetes) setup() {
 	if err != nil {
 		c.logger.Fatalf("failed getting file(s) from remote url, err: %s", err)
 	}
+
+	// NOTE: tunnel caching is performed in the init-container (setupOnly) so the launcher
+	// doesn't depend on in-pod access to the Kubernetes API at runtime.
 }
 
 func (c *clabernetes) launch() {
