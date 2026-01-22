@@ -4,14 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	clabernetesapisv1alpha1 "github.com/srl-labs/clabernetes/apis/v1alpha1"
 	clabernetesconstants "github.com/srl-labs/clabernetes/constants"
 	claberneteslauncherconnectivity "github.com/srl-labs/clabernetes/launcher/connectivity"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 func (c *clabernetes) connectivity() {
@@ -167,6 +171,13 @@ func (c *clabernetes) cacheNodeTunnels() error {
 		nodeTunnels = []*clabernetesapisv1alpha1.PointToPointTunnel{}
 	}
 
+	// Replace service FQDN destinations with endpoint IPs during init so runtime does not depend
+	// on in-pod DNS or access to the Service CIDR. Native-mode NOS containers can mutate routes on
+	// the shared pod netns, breaking DNS and kube API access inside the launcher.
+	if err := resolveTunnelDestinationsToEndpointIPs(c.ctx, nodeTunnels); err != nil {
+		return err
+	}
+
 	b, err := json.Marshal(nodeTunnels)
 	if err != nil {
 		return err
@@ -176,4 +187,72 @@ func (c *clabernetes) cacheNodeTunnels() error {
 	}
 	c.logger.Debugf("cached tunnels file: %s", p)
 	return nil
+}
+
+func resolveTunnelDestinationsToEndpointIPs(ctx context.Context, tunnels []*clabernetesapisv1alpha1.PointToPointTunnel) error {
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		return err
+	}
+	client, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return err
+	}
+
+	for _, t := range tunnels {
+		if t == nil || t.Destination == "" {
+			continue
+		}
+		if net.ParseIP(t.Destination) != nil {
+			continue
+		}
+		ip, err := resolveServiceEndpointIP(ctx, client, t.Destination)
+		if err != nil {
+			return fmt.Errorf("resolve vxlan destination %q: %w", t.Destination, err)
+		}
+		t.Destination = ip
+	}
+
+	return nil
+}
+
+func resolveServiceEndpointIP(ctx context.Context, client *kubernetes.Clientset, fqdn string) (string, error) {
+	parts := strings.Split(fqdn, ".")
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		return "", fmt.Errorf("invalid service fqdn: %q", fqdn)
+	}
+	serviceName := parts[0]
+	namespace := parts[1]
+
+	deadline := time.Now().Add(60 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		ep, err := client.CoreV1().Endpoints(namespace).Get(reqCtx, serviceName, metav1.GetOptions{})
+		cancel()
+		if err == nil && ep != nil {
+			for _, subset := range ep.Subsets {
+				for _, addr := range subset.Addresses {
+					if addr.IP != "" {
+						return addr.IP, nil
+					}
+				}
+				for _, addr := range subset.NotReadyAddresses {
+					if addr.IP != "" {
+						return addr.IP, nil
+					}
+				}
+			}
+			lastErr = fmt.Errorf("no endpoint addresses found for %s/%s", namespace, serviceName)
+		} else {
+			lastErr = err
+		}
+
+		time.Sleep(1 * time.Second)
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("timeout")
+	}
+	return "", lastErr
 }

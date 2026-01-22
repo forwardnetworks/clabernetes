@@ -43,6 +43,27 @@
                     {
                         "name": "docker",
                         "emptyDir": {}
+                    },
+                    {
+                        "name": "dev-kvm",
+                        "hostPath": {
+                            "path": "/dev/kvm",
+                            "type": ""
+                        }
+                    },
+                    {
+                        "name": "dev-fuse",
+                        "hostPath": {
+                            "path": "/dev/fuse",
+                            "type": ""
+                        }
+                    },
+                    {
+                        "name": "dev-net-tun",
+                        "hostPath": {
+                            "path": "/dev/net/tun",
+                            "type": ""
+                        }
                     }
                 ],
                 "containers": [
@@ -57,7 +78,7 @@
                         "ports": [
                             {
                                 "name": "vxlan",
-                                "containerPort": 14789,
+                                "containerPort": 6784,
                                 "protocol": "UDP"
                             },
                             {
@@ -167,6 +188,18 @@
                             {
                                 "name": "docker",
                                 "mountPath": "/var/lib/docker"
+                            },
+                            {
+                                "name": "dev-kvm",
+                                "mountPath": "/dev/kvm"
+                            },
+                            {
+                                "name": "dev-fuse",
+                                "mountPath": "/dev/fuse"
+                            },
+                            {
+                                "name": "dev-net-tun",
+                                "mountPath": "/dev/net/tun"
                             }
                         ],
                         "terminationMessagePath": "/dev/termination-log",

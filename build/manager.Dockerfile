@@ -1,6 +1,8 @@
-FROM golang:1.24-bookworm AS builder
+FROM --platform=$BUILDPLATFORM golang:1.24-bookworm AS builder
 
 ARG VERSION
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /clabernetes
 
@@ -19,8 +21,8 @@ COPY . .
 RUN go mod download
 
 RUN CGO_ENABLED=0 \
-    GOOS=linux \
-    GOARCH=amd64 \
+    GOOS=${TARGETOS} \
+    GOARCH=${TARGETARCH} \
     go build \
     -ldflags "-s -w -X github.com/srl-labs/clabernetes/constants.Version=${VERSION}" \
     -trimpath \
@@ -29,7 +31,7 @@ RUN CGO_ENABLED=0 \
     build/manager \
     cmd/clabernetes/main.go
 
-FROM --platform=linux/amd64 gcr.io/distroless/static-debian12:nonroot
+FROM --platform=$TARGETPLATFORM gcr.io/distroless/static-debian12:nonroot
 
 WORKDIR /clabernetes
 COPY --from=builder --chown=nonroot:nonroot /clabernetes/certificates /clabernetes/certificates

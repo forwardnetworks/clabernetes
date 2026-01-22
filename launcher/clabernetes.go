@@ -136,6 +136,13 @@ func (c *clabernetes) startup() {
 		c.logger.Info("native mode enabled, skipping docker image loading and container launch")
 	}
 
+	// In native mode, some NOS containers mutate routes in the shared pod netns.
+	// Keep the pod/CNI routes alive so connectivity tools (vxlan/slurpeeth) can reach
+	// remote tunnel endpoints.
+	if os.Getenv(clabernetesconstants.LauncherNativeModeEnv) == clabernetesconstants.True {
+		go c.startPodNetGuardian()
+	}
+
 	c.connectivity()
 
 	if os.Getenv(clabernetesconstants.LauncherNativeModeEnv) == clabernetesconstants.True &&
@@ -159,6 +166,13 @@ func (c *clabernetes) setupOnly() {
 
 	c.containerlabVersion()
 	c.setup()
+
+	// Snapshot the pod network state during init (before NOS starts). In native mode,
+	// some NOS containers can mutate shared pod routes; the launcher will re-apply
+	// these as needed at runtime.
+	if err := c.capturePodNetSnapshot(c.ctx); err != nil {
+		c.logger.Warnf("failed capturing pod net snapshot: %s", err)
+	}
 
 	// Cache tunnels during init-container setup so launch does not depend on Kubernetes API
 	// access from within the pod network namespace. Native-mode NOS containers can mutate

@@ -2,16 +2,22 @@ package connectivity
 
 import (
 	"context"
+	"crypto/sha1"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"reflect"
 	"strconv"
+	"strings"
 	"time"
 
 	clabernetesapisv1alpha1 "github.com/srl-labs/clabernetes/apis/v1alpha1"
 	clabernetesconstants "github.com/srl-labs/clabernetes/constants"
 	claberneteserrors "github.com/srl-labs/clabernetes/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 const (
@@ -91,13 +97,86 @@ func (m *vxlanManager) resolveVXLANService(vxlanRemote string) (string, error) {
 	}
 
 	if len(resolvedVxlanRemotes) != 1 {
-		return "", fmt.Errorf(
-			"%w: did not get exactly one ip resolved for remote vxlan endpoint",
-			claberneteserrors.ErrConnectivity,
-		)
+		// We've seen environments where the launcher's /etc/resolv.conf ends up without
+		// working nameservers, causing DNS lookups to default to localhost and fail.
+		// Fall back to resolving the ClusterIP/Endpoint via the Kubernetes API so vxlan
+		// connectivity doesn't depend on in-container DNS.
+		ip, kerr := resolveVXLANServiceViaKubeAPI(m.ctx, vxlanRemote)
+		if kerr != nil {
+			return "", fmt.Errorf(
+				"%w: did not get exactly one ip resolved for remote vxlan endpoint (dns=%v, kube=%v)",
+				claberneteserrors.ErrConnectivity,
+				err,
+				kerr,
+			)
+		}
+
+		m.logger.Warnf("resolved remote vxlan endpoint via kubernetes api: %s -> %s", vxlanRemote, ip)
+
+		return ip, nil
 	}
 
 	return resolvedVxlanRemotes[0].String(), nil
+}
+
+func resolveVXLANServiceViaKubeAPI(ctx context.Context, vxlanRemote string) (string, error) {
+	serviceName, namespace := parseServiceFQDN(vxlanRemote)
+	if serviceName == "" || namespace == "" {
+		return "", fmt.Errorf("%w: could not parse service name/namespace from %q", claberneteserrors.ErrInvalidData, vxlanRemote)
+	}
+
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		return "", err
+	}
+
+	client, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return "", err
+	}
+
+	svc, err := client.CoreV1().Services(namespace).Get(ctx, serviceName, metav1.GetOptions{})
+	if err != nil {
+		return "", err
+	}
+
+	if svc.Spec.ClusterIP != "" && svc.Spec.ClusterIP != "None" {
+		return svc.Spec.ClusterIP, nil
+	}
+
+	ep, err := client.CoreV1().Endpoints(namespace).Get(ctx, serviceName, metav1.GetOptions{})
+	if err != nil {
+		return "", err
+	}
+
+	for _, subset := range ep.Subsets {
+		for _, addr := range subset.Addresses {
+			if addr.IP != "" {
+				return addr.IP, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("%w: no endpoint addresses found for %s/%s", claberneteserrors.ErrConnectivity, namespace, serviceName)
+}
+
+func parseServiceFQDN(host string) (serviceName, namespace string) {
+	parts := strings.Split(host, ".")
+	if len(parts) >= 2 && parts[0] != "" && parts[1] != "" {
+		return parts[0], parts[1]
+	}
+
+	// Fall back to in-pod namespace (for short names like <svc> or <svc>.<ns>)
+	ns := os.Getenv("POD_NAMESPACE")
+	if ns == "" {
+		return "", ""
+	}
+
+	if len(parts) == 1 && parts[0] != "" {
+		return parts[0], ns
+	}
+
+	return "", ""
 }
 
 func (m *vxlanManager) runContainerlabVxlanToolsCreate(
@@ -106,17 +185,23 @@ func (m *vxlanManager) runContainerlabVxlanToolsCreate(
 	vxlanRemote string,
 	vxlanID int,
 ) error {
-	resolvedVxlanRemote, err := m.resolveVXLANService(vxlanRemote)
-	if err != nil {
-		return err
+	var err error
+	resolvedVxlanRemote := vxlanRemote
+	if net.ParseIP(vxlanRemote) == nil {
+		ip, err := m.resolveVXLANService(vxlanRemote)
+		if err != nil {
+			return err
+		}
+		resolvedVxlanRemote = ip
 	}
 
 	m.logger.Debugf("resolved remote vxlan tunnel service address as '%s'", resolvedVxlanRemote)
 
-	vxlanInterfaceName := fmt.Sprintf("%s-%s", localNodeName, cntLink)
+	link := sanitizeLinuxIfName(cntLink)
+	vxlanInterfaceName := fmt.Sprintf("%s-%s", localNodeName, link)
 	m.logger.Debugf("Attempting to delete existing vxlan interface '%s'", vxlanInterfaceName)
 
-	err = m.runContainerlabVxlanToolsDelete(m.ctx, localNodeName, cntLink)
+	err = m.runContainerlabVxlanToolsDelete(m.ctx, localNodeName, link)
 	if err != nil {
 		m.logger.Warnf(
 			"failed while deleting existing vxlan interface '%s', error: '%s'",
@@ -133,7 +218,7 @@ func (m *vxlanManager) runContainerlabVxlanToolsCreate(
 	//
 	// Since all containers in a pod share the same network namespace, we can create the expected veth
 	// pair in the pod netns: `<node>-<ifname>` <-> `<ifname>`.
-	err = m.ensurePodLinkExists(m.ctx, localNodeName, cntLink)
+	err = m.ensurePodLinkExists(m.ctx, localNodeName, link)
 	if err != nil {
 		return err
 	}
@@ -149,7 +234,7 @@ func (m *vxlanManager) runContainerlabVxlanToolsCreate(
 		"--id",
 		strconv.Itoa(vxlanID),
 		"--link",
-		fmt.Sprintf("%s-%s", localNodeName, cntLink),
+		fmt.Sprintf("%s-%s", localNodeName, link),
 		"--port",
 		strconv.Itoa(clabernetesconstants.VXLANServicePort),
 	)
@@ -257,6 +342,52 @@ func (m *vxlanManager) runContainerlabVxlanToolsDelete(
 	}
 
 	return nil
+}
+
+func sanitizeLinuxIfName(raw string) string {
+	// Linux interface names must be <= 15 bytes and cannot contain '/'.
+	// Some netlab/containerlab templates use interface identifiers like "Ethernet0/1"
+	// which are not valid Linux ifnames.
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "link"
+	}
+	s = strings.ReplaceAll(s, "/", "-")
+	s = strings.ReplaceAll(s, ":", "-")
+	s = strings.ReplaceAll(s, " ", "-")
+
+	// Keep only [A-Za-z0-9_.-]
+	b := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+			b = append(b, c)
+		case c >= 'A' && c <= 'Z':
+			b = append(b, c)
+		case c >= '0' && c <= '9':
+			b = append(b, c)
+		case c == '_' || c == '-' || c == '.':
+			b = append(b, c)
+		default:
+			// drop
+		}
+	}
+	s = string(b)
+	if s == "" {
+		return "link"
+	}
+	if len(s) <= 15 {
+		return s
+	}
+
+	sum := sha1.Sum([]byte(s)) //nolint:gosec // non-crypto identifier
+	suffix := fmt.Sprintf("%x", sum[:3]) // 6 chars
+	prefixLen := 15 - 1 - len(suffix)
+	if prefixLen < 1 {
+		return suffix[:15]
+	}
+	return s[:prefixLen] + "-" + suffix
 }
 
 func (m *vxlanManager) updateVxlanTunnels(

@@ -5,9 +5,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
-	"reflect"
 
 	clabernetesapisv1alpha1 "github.com/srl-labs/clabernetes/apis/v1alpha1"
 	clabernetesconfig "github.com/srl-labs/clabernetes/config"
@@ -163,8 +163,9 @@ func (r *NetworkAttachmentDefinitionReconciler) Render(
 		"bridge":     bridgeName,
 		"isGateway":  false,
 		"ipMasq":     false,
-		"hairpinMode": true,
-		"mtu":        9000,
+		// Disable hairpin to avoid nodes receiving their own link-local traffic (notably LLDP).
+		"hairpinMode": false,
+		"mtu":         9000,
 		"ipam": map[string]any{
 			"type":   "host-local",
 			"subnet": subnet,

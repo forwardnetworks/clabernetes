@@ -84,7 +84,7 @@
                         "ports": [
                             {
                                 "name": "vxlan",
-                                "containerPort": 14789,
+                                "containerPort": 6784,
                                 "protocol": "UDP"
                             },
                             {
@@ -189,17 +189,14 @@
                             },
                             {
                                 "name": "dev-kvm",
-                                "readOnly": true,
                                 "mountPath": "/dev/kvm"
                             },
                             {
                                 "name": "dev-fuse",
-                                "readOnly": true,
                                 "mountPath": "/dev/fuse"
                             },
                             {
                                 "name": "dev-net-tun",
-                                "readOnly": true,
                                 "mountPath": "/dev/net/tun"
                             }
                         ],
