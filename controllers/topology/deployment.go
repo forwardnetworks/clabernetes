@@ -1282,7 +1282,7 @@ no ip domain lookup
 username admin privilege 15 secret admin
 !
 interface Ethernet0/0
- ip address ${pod_ip} 255.255.255.255
+ ip address ${pod_ip} 255.255.255.0
  no shutdown
 !
 ip ssh version 2
