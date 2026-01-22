@@ -1108,27 +1108,6 @@ func (r *DeploymentReconciler) renderDeploymentContainer(
 			runtimeVol := "vrnetlab-runtime"
 			ensureEmptyDir(runtimeVol)
 
-			mountFile := func(mountPath, subPath string) {
-				mountPath = strings.TrimSpace(mountPath)
-				subPath = strings.TrimSpace(subPath)
-				if mountPath == "" || subPath == "" {
-					return
-				}
-				if _, ok := existingMounts[mountPath]; ok {
-					return
-				}
-				nosContainer.VolumeMounts = append(
-					nosContainer.VolumeMounts,
-					k8scorev1.VolumeMount{
-						Name:      runtimeVol,
-						ReadOnly:  false,
-						MountPath: mountPath,
-						SubPath:   subPath,
-					},
-				)
-				existingMounts[mountPath] = struct{}{}
-			}
-
 			if _, ok := existingMounts["/vrnetlab"]; !ok {
 				nosContainer.VolumeMounts = append(
 					nosContainer.VolumeMounts,
@@ -1144,11 +1123,6 @@ func (r *DeploymentReconciler) renderDeploymentContainer(
 			sum := sha1.Sum([]byte(strings.TrimSpace(owningTopology.Name) + ":" + strings.TrimSpace(nodeName))) //nolint:gosec // non-crypto identifier
 			pid := int(binary.BigEndian.Uint16(sum[:2])%1023) + 1
 			nvramName := fmt.Sprintf("nvram_%05d", pid)
-
-			mountFile("/iol/NETMAP", "NETMAP")
-			mountFile("/iol/iouyap.ini", "iouyap.ini")
-			mountFile("/iol/config.txt", "config.txt")
-			mountFile(fmt.Sprintf("/iol/%s", nvramName), nvramName)
 
 			// Mount the netlab-generated initial config snippet so we can incorporate it into the
 			// boot config we provide to the IOL process.
@@ -1306,6 +1280,12 @@ line vty 0 4
 !
 end
 CFGEOF
+
+# Symlink the runtime artifacts into /iol to match containerlab expectations.
+ln -sf /vrnetlab/NETMAP /iol/NETMAP
+ln -sf /vrnetlab/iouyap.ini /iol/iouyap.ini
+ln -sf /vrnetlab/config.txt /iol/config.txt
+ln -sf "/vrnetlab/${SKYFORGE_IOL_NVRAM}" "/iol/${SKYFORGE_IOL_NVRAM}"
 
 # Start iouyap (background) + IOL.
 /usr/bin/iouyap -f /iol/iouyap.ini 513 -q -d
