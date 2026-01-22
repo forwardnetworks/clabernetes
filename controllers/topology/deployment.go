@@ -1214,6 +1214,7 @@ func (r *DeploymentReconciler) renderDeploymentContainer(
 			nosContainer.Command = []string{"bash", "-lc", strings.TrimSpace(fmt.Sprintf(`
 set -euo pipefail
 echo "[skyforge] vrnetlab iol bootstrap starting (node=%s pid=%d)"
+node="%s"
 
 IFS=',' read -r -a link_ifaces <<< "${SKYFORGE_IOL_LINK_IFACES:-}"
 for ifn in "${link_ifaces[@]}"; do
@@ -1262,24 +1263,48 @@ touch "/vrnetlab/${SKYFORGE_IOL_NVRAM}"
   done
 } > /vrnetlab/iouyap.ini
 
-# Build config.txt from netlab snippet + minimal SSH config.
-if [ -f /netlab/initial.cfg ]; then
-  cat /netlab/initial.cfg > /vrnetlab/config.txt
-else
-  : > /vrnetlab/config.txt
-fi
+# Build /iol/config.txt (IOS boot config) similar to containerlab's iol kind driver,
+# but using the Kubernetes pod IP as the management IP to keep the in-cluster collector
+# able to reach the device.
+pod_ip="$(ip -4 -o addr show dev eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 || true)"
+gw="$(ip route 2>/dev/null | awk '/^default/ {print $3; exit}' || true)"
 
-grep -qi '^username ' /vrnetlab/config.txt || echo 'username admin privilege 15 secret admin' >> /vrnetlab/config.txt
-grep -qi '^ip ssh version' /vrnetlab/config.txt || echo 'ip ssh version 2' >> /vrnetlab/config.txt
-grep -qi '^crypto key generate rsa' /vrnetlab/config.txt || echo 'crypto key generate rsa modulus 2048' >> /vrnetlab/config.txt
-
-cat >> /vrnetlab/config.txt <<'CFGEOF'
+: > /vrnetlab/config.txt
+cat >> /vrnetlab/config.txt <<CFGEOF
+hostname ${node}
+!
+no aaa new-model
+!
+ip domain name lab
+!
+no ip domain lookup
+!
+username admin privilege 15 secret admin
+!
+interface Ethernet0/0
+ ip address ${pod_ip} 255.255.255.255
+ no shutdown
+!
+ip ssh version 2
+crypto key generate rsa modulus 2048
+!
 line vty 0 4
  login local
  transport input ssh
 !
-end
 CFGEOF
+
+if [ -n "${gw}" ]; then
+  echo "ip route 0.0.0.0 0.0.0.0 Ethernet0/0 ${gw}" >> /vrnetlab/config.txt
+  echo "!" >> /vrnetlab/config.txt
+fi
+
+if [ -f /netlab/initial.cfg ]; then
+  cat /netlab/initial.cfg >> /vrnetlab/config.txt
+  echo "!" >> /vrnetlab/config.txt
+fi
+
+echo "end" >> /vrnetlab/config.txt
 
 # Symlink the runtime artifacts into /iol to match containerlab expectations.
 ln -sf /vrnetlab/NETMAP /iol/NETMAP
@@ -1292,9 +1317,10 @@ ln -sf "/vrnetlab/${SKYFORGE_IOL_NVRAM}" "/iol/${SKYFORGE_IOL_NVRAM}"
 
 ports=$(( ${#link_ifaces[@]} + 1 ))
 slots=$(( (ports + 3) / 4 ))
-echo "[skyforge] starting iol.bin (slots=$slots ports=$ports)"
-exec /iol/iol.bin "$IOL_PID" -e "$slots" -s 0 -c /iol/config.txt -n 1024
-`, nodeName, pid))}
+echo "[skyforge] starting iol.bin (slots=$slots ports=$ports pod_ip=${pod_ip} gw=${gw})"
+cd /iol
+exec ./iol.bin "$IOL_PID" -e "$slots" -s 0 -c config.txt -n 1024
+`, nodeName, pid, nodeName))}
 		}
 
 		// Best-effort support for bind mounts in native mode.
