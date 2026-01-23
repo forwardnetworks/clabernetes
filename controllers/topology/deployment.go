@@ -217,6 +217,12 @@ func (r *DeploymentReconciler) Render(
 		clabernetesConfigs,
 	)
 
+	r.renderDeploymentVrnetlabMgmt(
+		deployment,
+		nodeName,
+		clabernetesConfigs,
+	)
+
 	r.renderDeploymentContainerEnv(
 		deployment,
 		nodeName,
@@ -1234,16 +1240,72 @@ touch "/vrnetlab/${SKYFORGE_IOL_NVRAM}"
 
 # NETMAP: map ios ports to linux ifaces configured in iouyap.ini.
 {
-  echo "1:0/0 513:0/0"
+  echo "${IOL_PID}:0/0 513:0/0"
   idx=1
   for ifn in "${link_ifaces[@]}"; do
     if [ -z "$ifn" ]; then
       continue
     fi
-    echo "1:0/$idx 513:0/$idx"
+    slot=$((idx / 4))
+    port=$((idx %% 4))
+    echo "${IOL_PID}:${slot}/${port} 513:${slot}/${port}"
     idx=$((idx+1))
   done
 } > /vrnetlab/NETMAP
+
+# Build /iol/config.txt (IOS boot config) similar to containerlab's iol kind driver,
+# but using the dedicated vrnetlab Multus management interface (net1).
+#
+# IMPORTANT: We *must* remove the assigned IP from net1 in the Linux network namespace,
+# otherwise the kernel will consume TCP/22 for that address and IOS will never see SSH
+# traffic. By moving IOS mgmt to net1 we preserve eth0 for Kubernetes control plane traffic.
+for i in $(seq 1 30); do
+  if [ -e "/sys/class/net/net1" ]; then
+    break
+  fi
+  sleep 1
+done
+# net1 can show up slightly before its IPv4 address is assigned by CNI.
+# Retry for a bit to avoid crashlooping on fast startups.
+ip link set net1 up 2>/dev/null || true
+mgmt_ip=""
+mgmt_gw=""
+for i in $(seq 1 60); do
+  mgmt_ip="$(ip -4 -o addr show dev net1 2>/dev/null | awk '{print $4}' | cut -d/ -f1 || true)"
+  mgmt_gw="$(ip route show dev net1 2>/dev/null | awk '/^default/ {print $3; exit}' || true)"
+  if [ -n "${mgmt_ip}" ]; then
+    break
+  fi
+  sleep 1
+done
+
+if [ -z "${mgmt_ip}" ]; then
+  echo "[skyforge] vrnetlab iol mgmt interface net1 missing or has no IPv4 address"
+  exit 1
+fi
+
+# If net1 is a veth (Multus bridge CNI), we've observed that direct raw-socket access to
+# net1 can be unreliable. In that case, bridge net1 to a veth pair and have IOUYAP use
+# the veth peer. If net1 is ipvlan (our preferred mode), IOUYAP can use net1 directly.
+MGMT_DEV="net1"
+if ip -d link show net1 2>/dev/null | grep -q " veth "; then
+  BR="br-iol-mgmt"
+  VETH_HOST="veth-mgmt"
+  VETH_IOU="veth-iou"
+  ip link add "$BR" type bridge 2>/dev/null || true
+  ip link set "$BR" up
+  ip link set net1 master "$BR" 2>/dev/null || true
+  ip link set net1 up
+  ip link add "$VETH_HOST" type veth peer name "$VETH_IOU" 2>/dev/null || true
+  ip link set "$VETH_HOST" up
+  ip link set "$VETH_IOU" up
+  ip link set "$VETH_HOST" master "$BR" 2>/dev/null || true
+  MGMT_DEV="$VETH_IOU"
+fi
+# Always ensure the vrnetlab mgmt interface is up. If it's left DOWN, iouyap will
+# exit with "Network is down", and IOS will never get a working management plane.
+ip link set net1 up 2>/dev/null || true
+ip addr flush dev net1 || true
 
 # IOUYAP config mapping bay/unit ports to linux ifaces.
 {
@@ -1251,23 +1313,23 @@ touch "/vrnetlab/${SKYFORGE_IOL_NVRAM}"
   echo "base_port = 49000"
   echo "netmap = /iol/NETMAP"
   echo "[513:0/0]"
-  echo "eth_dev = eth0"
+  # Management interface:
+  # - net1 comes from the vrnetlab-mgmt Multus attachment.
+  # - eth0 must remain reserved for Kubernetes/Cilium so the clabernetes launcher can reach
+  #   the API server and manage the pod.
+  echo "eth_dev = ${MGMT_DEV}"
   idx=1
   for ifn in "${link_ifaces[@]}"; do
     if [ -z "$ifn" ]; then
       continue
     fi
-    echo "[513:0/$idx]"
+    slot=$((idx / 4))
+    port=$((idx %% 4))
+    echo "[513:${slot}/${port}]"
     echo "eth_dev = $ifn"
     idx=$((idx+1))
   done
 } > /vrnetlab/iouyap.ini
-
-# Build /iol/config.txt (IOS boot config) similar to containerlab's iol kind driver,
-# but using the Kubernetes pod IP as the management IP to keep the in-cluster collector
-# able to reach the device.
-pod_ip="$(ip -4 -o addr show dev eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 || true)"
-gw="$(ip route 2>/dev/null | awk '/^default/ {print $3; exit}' || true)"
 
 : > /vrnetlab/config.txt
 cat >> /vrnetlab/config.txt <<CFGEOF
@@ -1277,13 +1339,28 @@ no aaa new-model
 !
 ip domain name lab
 !
+ip cef
+!
+ipv6 unicast-routing
+!
 no ip domain lookup
 !
 username admin privilege 15 secret admin
 !
+vrf definition clab-mgmt
+ description clab-mgmt
+ address-family ipv4
+ !
+ address-family ipv6
+ !
+!
 interface Ethernet0/0
- ip address ${pod_ip} 255.255.255.0
+ vrf forwarding clab-mgmt
+ description clab-mgmt
+ ip address ${mgmt_ip} 255.255.255.0
  no shutdown
+!
+ip forward-protocol nd
 !
 ip ssh version 2
 crypto key generate rsa modulus 2048
@@ -1294,15 +1371,27 @@ line vty 0 4
 !
 CFGEOF
 
-if [ -n "${gw}" ]; then
-  echo "ip route 0.0.0.0 0.0.0.0 Ethernet0/0 ${gw}" >> /vrnetlab/config.txt
+if [ -n "${mgmt_gw}" ]; then
+  echo "ip route vrf clab-mgmt 0.0.0.0 0.0.0.0 Ethernet0/0 ${mgmt_gw}" >> /vrnetlab/config.txt
   echo "!" >> /vrnetlab/config.txt
 fi
 
 if [ -f /netlab/initial.cfg ]; then
-  cat /netlab/initial.cfg >> /vrnetlab/config.txt
+  # netlab-generated initial.cfg may include its own "line vty" stanza. That can
+  # unintentionally disable SSH access. Strip it and re-assert SSH on the vty lines below.
+  #
+  # It also commonly includes an "interface Ethernet0/0" stanza (management interface for IOL)
+  # which can override the vrf/ip config we generate above. Strip that too.
+  sed -e '/^line vty 0 4/,/^!$/d' -e '/^interface Ethernet0\\/0$/,/^!$/d' /netlab/initial.cfg >> /vrnetlab/config.txt
   echo "!" >> /vrnetlab/config.txt
 fi
+
+cat >> /vrnetlab/config.txt <<CFGEOF
+line vty 0 4
+ login local
+ transport input ssh
+!
+CFGEOF
 
 echo "end" >> /vrnetlab/config.txt
 
@@ -1317,7 +1406,7 @@ ln -sf "/vrnetlab/${SKYFORGE_IOL_NVRAM}" "/iol/${SKYFORGE_IOL_NVRAM}"
 
 ports=$(( ${#link_ifaces[@]} + 1 ))
 slots=$(( (ports + 3) / 4 ))
-echo "[skyforge] starting iol.bin (slots=$slots ports=$ports pod_ip=${pod_ip} gw=${gw})"
+echo "[skyforge] starting iol.bin (slots=$slots ports=$ports mgmt_ip=${mgmt_ip} gw=${mgmt_gw})"
 cd /iol
 exec ./iol.bin "$IOL_PID" -e "$slots" -s 0 -c config.txt -n 1024
 `, nodeName, pid, nodeName))}
@@ -1450,12 +1539,30 @@ func (r *DeploymentReconciler) renderDeploymentMultus(
 	// for simplicity we'll just use the short format if possible, but let's do the json one
 	// to be explicit and future-proof.
 	type multusNet struct {
-		Name string `json:"name"`
+		Name      string `json:"name"`
+		Namespace string `json:"namespace,omitempty"`
 	}
 
 	multusNets := make([]multusNet, len(networkNames))
 	for i, name := range networkNames {
 		multusNets[i] = multusNet{Name: name}
+	}
+
+	// If this node runs a vrnetlab-based NOS (IOL/VIOS/NXOSv/etc), add a dedicated
+	// management network attachment.
+	//
+	// Many vrnetlab images assume they can take over eth0 and may flush its IP
+	// addresses. In Kubernetes, eth0 is the pod network, so losing it breaks
+	// pod connectivity. A secondary Multus interface gives the NOS an interface
+	// it can own without affecting the pod network.
+	//
+	// This NetworkAttachmentDefinition is installed by Skyforge Helm as:
+	//   kube-system/vrnetlab-mgmt
+	if node, ok := nodeConfig.Topology.Nodes[nodeName]; ok {
+		switch strings.TrimSpace(node.Kind) {
+		case "cisco_iol", "vios", "viosl2", "vr-n9kv", "asav", "vmx", "sros", "csr":
+			multusNets = append(multusNets, multusNet{Name: "vrnetlab-mgmt", Namespace: "kube-system"})
+		}
 	}
 
 	multusNetsJSON, err := json.Marshal(multusNets)
@@ -1470,6 +1577,55 @@ func (r *DeploymentReconciler) renderDeploymentMultus(
 	}
 
 	deployment.Spec.Template.Annotations["k8s.v1.cni.cncf.io/networks"] = string(multusNetsJSON)
+}
+
+func (r *DeploymentReconciler) renderDeploymentVrnetlabMgmt(
+	deployment *k8sappsv1.Deployment,
+	nodeName string,
+	clabernetesConfigs map[string]*clabernetesutilcontainerlab.Config,
+) {
+	nodeConfig, ok := clabernetesConfigs[nodeName]
+	if !ok {
+		return
+	}
+	node, ok := nodeConfig.Topology.Nodes[nodeName]
+	if !ok {
+		return
+	}
+
+	switch strings.TrimSpace(node.Kind) {
+	case "cisco_iol", "vios", "viosl2", "vr-n9kv", "asav", "vmx", "sros", "csr":
+	default:
+		return
+	}
+
+	type multusNet struct {
+		Name      string `json:"name"`
+		Namespace string `json:"namespace,omitempty"`
+	}
+
+	if deployment.Spec.Template.Annotations == nil {
+		deployment.Spec.Template.Annotations = make(map[string]string)
+	}
+
+	cur := strings.TrimSpace(deployment.Spec.Template.Annotations["k8s.v1.cni.cncf.io/networks"])
+	nets := []multusNet{}
+	if cur != "" {
+		_ = json.Unmarshal([]byte(cur), &nets)
+	}
+	for _, n := range nets {
+		if strings.TrimSpace(n.Name) == "vrnetlab-mgmt" && strings.TrimSpace(n.Namespace) == "kube-system" {
+			return
+		}
+	}
+	nets = append(nets, multusNet{Name: "vrnetlab-mgmt", Namespace: "kube-system"})
+
+	raw, err := json.Marshal(nets)
+	if err != nil {
+		r.log.Criticalf("failed marshaling vrnetlab mgmt multus networks to json, error: %s", err)
+		return
+	}
+	deployment.Spec.Template.Annotations["k8s.v1.cni.cncf.io/networks"] = string(raw)
 }
 
 func (r *DeploymentReconciler) renderDeploymentNative(
