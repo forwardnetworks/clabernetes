@@ -1390,14 +1390,14 @@ fi
 	  # which can override the vrf/ip config we generate above. Strip that too.
 	  # NOTE: we intentionally avoid sed here. BusyBox sed can fail to parse the
 	  # "Ethernet0/0" address range expression, causing the container to crashloop.
-	  awk '
-	    BEGIN { in_vty=0; in_mgmt_if=0 }
-	    /^line vty 0 4$/ { in_vty=1; next }
-	    /^interface Ethernet0\\/0$/ { in_mgmt_if=1; next }
-	    in_vty {
-	      if ($0 == "!") { in_vty=0 }
-	      next
-	    }
+		  awk '
+		    BEGIN { in_vty=0; in_mgmt_if=0 }
+		    $0 == "line vty 0 4" { in_vty=1; next }
+		    $0 == "interface Ethernet0/0" { in_mgmt_if=1; next }
+		    in_vty {
+		      if ($0 == "!") { in_vty=0 }
+		      next
+		    }
 	    in_mgmt_if {
 	      if ($0 == "!") { in_mgmt_if=0 }
 	      next
