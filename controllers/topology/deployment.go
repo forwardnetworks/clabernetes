@@ -1279,10 +1279,16 @@ for i in $(seq 1 60); do
   sleep 1
 done
 
+if [ -z "${mgmt_ip}" ] && [ -f /vrnetlab/mgmt_ip ]; then
+  mgmt_ip="$(cat /vrnetlab/mgmt_ip 2>/dev/null || true)"
+fi
+
 if [ -z "${mgmt_ip}" ]; then
   echo "[skyforge] vrnetlab iol mgmt interface net1 missing or has no IPv4 address"
   exit 1
 fi
+
+echo "${mgmt_ip}" > /vrnetlab/mgmt_ip || true
 
 # If net1 is a veth (Multus bridge CNI), we've observed that direct raw-socket access to
 # net1 can be unreliable. In that case, bridge net1 to a veth pair and have IOUYAP use
