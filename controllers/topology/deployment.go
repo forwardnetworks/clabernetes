@@ -1353,15 +1353,7 @@ no ip domain lookup
 !
 username admin privilege 15 secret admin
 !
-vrf definition clab-mgmt
- description clab-mgmt
- address-family ipv4
- !
- address-family ipv6
- !
-!
 interface Ethernet0/0
- vrf forwarding clab-mgmt
  description clab-mgmt
  ip address ${mgmt_ip} 255.255.255.0
  no shutdown
@@ -1378,7 +1370,7 @@ line vty 0 4
 CFGEOF
 
 if [ -n "${mgmt_gw}" ]; then
-  echo "ip route vrf clab-mgmt 0.0.0.0 0.0.0.0 Ethernet0/0 ${mgmt_gw}" >> /vrnetlab/config.txt
+  echo "ip route 0.0.0.0 0.0.0.0 Ethernet0/0 ${mgmt_gw}" >> /vrnetlab/config.txt
   echo "!" >> /vrnetlab/config.txt
 fi
 
