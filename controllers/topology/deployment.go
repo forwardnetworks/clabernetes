@@ -217,12 +217,6 @@ func (r *DeploymentReconciler) Render(
 		clabernetesConfigs,
 	)
 
-	r.renderDeploymentVrnetlabMgmt(
-		deployment,
-		nodeName,
-		clabernetesConfigs,
-	)
-
 	r.renderDeploymentContainerEnv(
 		deployment,
 		nodeName,
@@ -503,6 +497,9 @@ func (r *DeploymentReconciler) renderDeploymentScheduling(
 	tolerations := owningTopology.Spec.Deployment.Scheduling.Tolerations
 
 	deployment.Spec.Template.Spec.Tolerations = tolerations
+	if owningTopology.Spec.Deployment.Scheduling.Affinity != nil {
+		deployment.Spec.Template.Spec.Affinity = owningTopology.Spec.Deployment.Scheduling.Affinity
+	}
 
 	// Nothing else to do for scheduling here; node placement is controlled by Topology scheduling
 	// config and cluster policies.
@@ -1160,6 +1157,42 @@ func (r *DeploymentReconciler) renderDeploymentContainer(
 				}
 			}
 
+			// Skyforge C9s mounts netlab outputs (node_files, etc) under /tmp/skyforge-c9s/...
+			// Those mounts are always present in the launcher container, but the IOL bootstrap
+			// script that assembles /vrnetlab/config.txt runs in the NOS container. Mount the
+			// same files into the NOS container so it can append cfglets (e.g. "eigrp", "extra").
+			for _, f := range owningTopology.Spec.Deployment.FilesFromConfigMap[nodeName] {
+				if strings.TrimSpace(f.ConfigMapName) == "" || strings.TrimSpace(f.ConfigMapPath) == "" {
+					continue
+				}
+				mountPath := strings.TrimSpace(f.FilePath)
+				if mountPath == "" {
+					continue
+				}
+				if !strings.HasPrefix(mountPath, "/tmp/skyforge-c9s/") {
+					continue
+				}
+				if _, ok := existingMounts[mountPath]; ok {
+					continue
+				}
+				volumeName := clabernetesutilkubernetes.EnforceDNSLabelConvention(
+					clabernetesutilkubernetes.SafeConcatNameKubernetes(
+						f.ConfigMapName,
+						f.ConfigMapPath,
+					),
+				)
+				nosContainer.VolumeMounts = append(
+					nosContainer.VolumeMounts,
+					k8scorev1.VolumeMount{
+						Name:      volumeName,
+						ReadOnly:  true,
+						MountPath: mountPath,
+						SubPath:   f.ConfigMapPath,
+					},
+				)
+				existingMounts[mountPath] = struct{}{}
+			}
+
 			upsertEnv := func(key, value string) {
 				key = strings.TrimSpace(key)
 				if key == "" {
@@ -1254,64 +1287,31 @@ touch "/vrnetlab/${SKYFORGE_IOL_NVRAM}"
 } > /vrnetlab/NETMAP
 
 # Build /iol/config.txt (IOS boot config) similar to containerlab's iol kind driver,
-# but using the dedicated vrnetlab Multus management interface (net1).
+# but without Multus. We use the Kubernetes pod interface (eth0) as the IOS management
+# interface and "steal" its IP:
+# - read the pod IP + default gateway from eth0
+# - flush eth0 addresses so the kernel stops consuming TCP/22 for that IP
+# - configure IOS Ethernet0/0 with that IP and a default route via the pod gateway
 #
-# IMPORTANT: We *must* remove the assigned IP from net1 in the Linux network namespace,
-# otherwise the kernel will consume TCP/22 for that address and IOS will never see SSH
-# traffic. By moving IOS mgmt to net1 we preserve eth0 for Kubernetes control plane traffic.
-for i in $(seq 1 30); do
-  if [ -e "/sys/class/net/net1" ]; then
-    break
-  fi
-  sleep 1
-done
-# net1 can show up slightly before its IPv4 address is assigned by CNI.
-# Retry for a bit to avoid crashlooping on fast startups.
-ip link set net1 up 2>/dev/null || true
-mgmt_ip=""
-mgmt_gw=""
-for i in $(seq 1 60); do
-  mgmt_ip="$(ip -4 -o addr show dev net1 2>/dev/null | awk '{print $4}' | cut -d/ -f1 || true)"
-  mgmt_gw="$(ip route show dev net1 2>/dev/null | awk '/^default/ {print $3; exit}' || true)"
-  if [ -n "${mgmt_ip}" ]; then
-    break
-  fi
-  sleep 1
-done
-
-if [ -z "${mgmt_ip}" ] && [ -f /vrnetlab/mgmt_ip ]; then
-  mgmt_ip="$(cat /vrnetlab/mgmt_ip 2>/dev/null || true)"
-fi
+# NOTE: This intentionally sacrifices in-pod L3 connectivity after IOS starts. We rely on
+# kubelet exec/logging for introspection, and Forward reaches the IOS management plane on
+# the pod IP once IOS owns it.
+MGMT_DEV="eth0"
+mgmt_ip="$(ip -4 -o addr show dev eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 || true)"
+mgmt_gw="$(ip route show default 2>/dev/null | awk '/^default/ {print $3; exit}' || true)"
 
 if [ -z "${mgmt_ip}" ]; then
-  echo "[skyforge] vrnetlab iol mgmt interface net1 missing or has no IPv4 address"
+  echo "[skyforge] vrnetlab iol mgmt interface eth0 missing or has no IPv4 address"
+  ip -4 -o addr show dev eth0 2>/dev/null || true
   exit 1
 fi
 
 echo "${mgmt_ip}" > /vrnetlab/mgmt_ip || true
+echo "${mgmt_gw}" > /vrnetlab/mgmt_gw || true
 
-# If net1 is a veth (Multus bridge CNI), we've observed that direct raw-socket access to
-# net1 can be unreliable. In that case, bridge net1 to a veth pair and have IOUYAP use
-# the veth peer. If net1 is ipvlan (our preferred mode), IOUYAP can use net1 directly.
-MGMT_DEV="net1"
-if ip -d link show net1 2>/dev/null | grep -q " veth "; then
-  BR="br-iol-mgmt"
-  VETH_HOST="veth-mgmt"
-  VETH_IOU="veth-iou"
-  ip link add "$BR" type bridge 2>/dev/null || true
-  ip link set "$BR" up
-  ip link set net1 master "$BR" 2>/dev/null || true
-  ip link set net1 up
-  ip link add "$VETH_HOST" type veth peer name "$VETH_IOU" 2>/dev/null || true
-  ip link set "$VETH_HOST" up
-  ip link set "$VETH_IOU" up
-  ip link set "$VETH_HOST" master "$BR" 2>/dev/null || true
-  MGMT_DEV="$VETH_IOU"
-fi
-# Always ensure the vrnetlab mgmt interface is up. If it's left DOWN, iouyap will
-# exit with "Network is down", and IOS will never get a working management plane.
-ip link set net1 up 2>/dev/null || true
-ip addr flush dev net1 || true
+ip link set eth0 up 2>/dev/null || true
+ip addr flush dev eth0 || true
+ip -6 addr flush dev eth0 || true
 
 # IOUYAP config mapping bay/unit ports to linux ifaces.
 {
@@ -1320,9 +1320,6 @@ ip addr flush dev net1 || true
   echo "netmap = /iol/NETMAP"
   echo "[513:0/0]"
   # Management interface:
-  # - net1 comes from the vrnetlab-mgmt Multus attachment.
-  # - eth0 must remain reserved for Kubernetes/Cilium so the clabernetes launcher can reach
-  #   the API server and manage the pod.
   echo "eth_dev = ${MGMT_DEV}"
   idx=1
   for ifn in "${link_ifaces[@]}"; do
@@ -1355,7 +1352,10 @@ username admin privilege 15 secret admin
 !
 interface Ethernet0/0
  description clab-mgmt
- ip address ${mgmt_ip} 255.255.255.0
+ ip address ${mgmt_ip} 255.255.255.255
+ no cdp enable
+ no lldp transmit
+ no lldp receive
  no shutdown
 !
 ip forward-protocol nd
@@ -1394,10 +1394,47 @@ fi
 	      if ($0 == "!") { in_mgmt_if=0 }
 	      next
 	    }
+		    # netlab can emit IOS/IOS-XE SSH settings that bind the SSH server to a
+		    # management VRF or a specific source-interface. In Skyforge we keep the
+		    # vrnetlab mgmt NIC (Ethernet0/0) in the global routing table so the
+		    # in-cluster Forward collector can reach it. Strip those directives to
+		    # avoid accidentally forcing SSH to listen in a non-existent VRF.
+		    $0 ~ /^ip ssh server vrf / { next }
+		    $0 ~ /^ip ssh source-interface / { next }
 	    { print }
 	  ' /netlab/initial.cfg >> /vrnetlab/config.txt
 	  echo "!" >> /vrnetlab/config.txt
 	fi
+
+	# netlab produces additional cfglets/snippets under /tmp/skyforge-c9s/<topology>/node_files/<node>/.
+	# For IOS/IOS-XE (IOL) we want those applied as part of the initial config load, so append them
+	# to the vrnetlab config file (filtering out vty/mgmt interface stanzas the same way as above).
+	for f in /tmp/skyforge-c9s/*/node_files/${node}/*; do
+	  if [ ! -f "$f" ]; then
+	    continue
+	  fi
+	  bn="$(basename "$f")"
+	  if [ "$bn" = "initial" ] || [ "$bn" = "initial.cfg" ]; then
+	    continue
+	  fi
+	  awk '
+	    BEGIN { in_vty=0; in_mgmt_if=0 }
+	    $0 == "line vty 0 4" { in_vty=1; next }
+	    $0 == "interface Ethernet0/0" { in_mgmt_if=1; next }
+	    in_vty {
+	      if ($0 == "!") { in_vty=0 }
+	      next
+	    }
+	    in_mgmt_if {
+	      if ($0 == "!") { in_mgmt_if=0 }
+	      next
+	    }
+	    $0 ~ /^ip ssh server vrf / { next }
+	    $0 ~ /^ip ssh source-interface / { next }
+	    { print }
+	  ' "$f" >> /vrnetlab/config.txt
+	  echo "!" >> /vrnetlab/config.txt
+	done
 
 cat >> /vrnetlab/config.txt <<CFGEOF
 line vty 0 4
@@ -1590,55 +1627,6 @@ func (r *DeploymentReconciler) renderDeploymentMultus(
 	}
 
 	deployment.Spec.Template.Annotations["k8s.v1.cni.cncf.io/networks"] = string(multusNetsJSON)
-}
-
-func (r *DeploymentReconciler) renderDeploymentVrnetlabMgmt(
-	deployment *k8sappsv1.Deployment,
-	nodeName string,
-	clabernetesConfigs map[string]*clabernetesutilcontainerlab.Config,
-) {
-	nodeConfig, ok := clabernetesConfigs[nodeName]
-	if !ok {
-		return
-	}
-	node, ok := nodeConfig.Topology.Nodes[nodeName]
-	if !ok {
-		return
-	}
-
-	switch strings.TrimSpace(node.Kind) {
-	case "cisco_iol", "vios", "viosl2", "vr-n9kv", "asav", "vmx", "sros", "csr":
-	default:
-		return
-	}
-
-	type multusNet struct {
-		Name      string `json:"name"`
-		Namespace string `json:"namespace,omitempty"`
-	}
-
-	if deployment.Spec.Template.Annotations == nil {
-		deployment.Spec.Template.Annotations = make(map[string]string)
-	}
-
-	cur := strings.TrimSpace(deployment.Spec.Template.Annotations["k8s.v1.cni.cncf.io/networks"])
-	nets := []multusNet{}
-	if cur != "" {
-		_ = json.Unmarshal([]byte(cur), &nets)
-	}
-	for _, n := range nets {
-		if strings.TrimSpace(n.Name) == "vrnetlab-mgmt" && strings.TrimSpace(n.Namespace) == "kube-system" {
-			return
-		}
-	}
-	nets = append(nets, multusNet{Name: "vrnetlab-mgmt", Namespace: "kube-system"})
-
-	raw, err := json.Marshal(nets)
-	if err != nil {
-		r.log.Criticalf("failed marshaling vrnetlab mgmt multus networks to json, error: %s", err)
-		return
-	}
-	deployment.Spec.Template.Annotations["k8s.v1.cni.cncf.io/networks"] = string(raw)
 }
 
 func (r *DeploymentReconciler) renderDeploymentNative(
