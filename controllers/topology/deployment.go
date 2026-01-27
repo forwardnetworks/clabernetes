@@ -1447,7 +1447,7 @@ ln -sf "/vrnetlab/${SKYFORGE_IOL_NVRAM}" "/iol/${SKYFORGE_IOL_NVRAM}"
 
 ports=$(( ${#link_ifaces[@]} + 1 ))
 slots=$(( (ports + 3) / 4 ))
-echo "[skyforge] starting iol.bin (slots=$slots ports=$ports mgmt_ip=${mgmt_ip} gw=${mgmt_gw})"
+echo "[skyforge] starting iol.bin (slots=$slots ports=$ports mgmt=${MGMT_IOS_IP}/${MGMT_IOS_MASK})"
 cd /iol
 exec ./iol.bin "$IOL_PID" -e "$slots" -s 0 -c config.txt -n 1024
 `, nodeName, pid, nodeName))}
