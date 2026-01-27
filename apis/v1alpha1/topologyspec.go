@@ -232,6 +232,9 @@ type Scheduling struct {
 	// Topology.
 	// +optional
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+	// Affinity configures pod affinity/anti-affinity and node affinity for launcher pods.
+	// +optional
+	Affinity *k8scorev1.Affinity `json:"affinity,omitempty"`
 	// Tolerations is a list of Tolerations that will be set on the launcher pod spec.
 	// +listType=atomic
 	// +optional
