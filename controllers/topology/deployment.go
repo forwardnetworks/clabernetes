@@ -1286,32 +1286,28 @@ touch "/vrnetlab/${SKYFORGE_IOL_NVRAM}"
   done
 } > /vrnetlab/NETMAP
 
-# Build /iol/config.txt (IOS boot config) similar to containerlab's iol kind driver,
-# but without Multus. We use the Kubernetes pod interface (eth0) as the IOS management
-# interface and "steal" its IP:
-# - read the pod IP + default gateway from eth0
-# - flush eth0 addresses so the kernel stops consuming TCP/22 for that IP
-# - configure IOS Ethernet0/0 with that IP and a default route via the pod gateway
+# Build /iol/config.txt (IOS boot config) similar to containerlab's iol kind driver.
 #
-# NOTE: This intentionally sacrifices in-pod L3 connectivity after IOS starts. We rely on
-# kubelet exec/logging for introspection, and Forward reaches the IOS management plane on
-# the pod IP once IOS owns it.
-MGMT_DEV="eth0"
-mgmt_ip="$(ip -4 -o addr show dev eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 || true)"
-mgmt_gw="$(ip route show default 2>/dev/null | awk '/^default/ {print $3; exit}' || true)"
+# Important: do NOT "steal" the Kubernetes pod IP (eth0) for IOS management.
+# In CNI setups like Cilium where pod IPs are /32 and routed, moving the pod IP
+# into the VM breaks pod routing and makes the pod unreachable from other nodes.
+#
+# Instead, create an internal management veth pair:
+# - host side: vrl-mgmt0 (169.254.100.1/30)
+# - IOS side:  vrl-mgmt1 (attached to IOS Ethernet0/0 via iouyap)
+# The clabernetes launcher will run a TCP proxy on podIP:22 -> 169.254.100.2:22.
+MGMT_HOST_DEV="vrl-mgmt0"
+MGMT_IOS_DEV="vrl-mgmt1"
+MGMT_HOST_IP="169.254.100.1/30"
+MGMT_IOS_IP="169.254.100.2"
+MGMT_IOS_MASK="255.255.255.252"
 
-if [ -z "${mgmt_ip}" ]; then
-  echo "[skyforge] vrnetlab iol mgmt interface eth0 missing or has no IPv4 address"
-  ip -4 -o addr show dev eth0 2>/dev/null || true
-  exit 1
+if ! ip link show "${MGMT_HOST_DEV}" >/dev/null 2>&1; then
+  ip link add "${MGMT_HOST_DEV}" type veth peer name "${MGMT_IOS_DEV}"
 fi
-
-echo "${mgmt_ip}" > /vrnetlab/mgmt_ip || true
-echo "${mgmt_gw}" > /vrnetlab/mgmt_gw || true
-
-ip link set eth0 up 2>/dev/null || true
-ip addr flush dev eth0 || true
-ip -6 addr flush dev eth0 || true
+ip link set "${MGMT_HOST_DEV}" up
+ip link set "${MGMT_IOS_DEV}" up
+ip addr replace "${MGMT_HOST_IP}" dev "${MGMT_HOST_DEV}"
 
 # IOUYAP config mapping bay/unit ports to linux ifaces.
 {
@@ -1320,7 +1316,7 @@ ip -6 addr flush dev eth0 || true
   echo "netmap = /iol/NETMAP"
   echo "[513:0/0]"
   # Management interface:
-  echo "eth_dev = ${MGMT_DEV}"
+  echo "eth_dev = ${MGMT_IOS_DEV}"
   idx=1
   for ifn in "${link_ifaces[@]}"; do
     if [ -z "$ifn" ]; then
@@ -1352,7 +1348,7 @@ username admin privilege 15 secret admin
 !
 interface Ethernet0/0
  description clab-mgmt
- ip address ${mgmt_ip} 255.255.255.255
+ ip address ${MGMT_IOS_IP} ${MGMT_IOS_MASK}
  no cdp enable
  no lldp transmit
  no lldp receive
@@ -1368,11 +1364,6 @@ line vty 0 4
  transport input ssh
 !
 CFGEOF
-
-if [ -n "${mgmt_gw}" ]; then
-  echo "ip route 0.0.0.0 0.0.0.0 Ethernet0/0 ${mgmt_gw}" >> /vrnetlab/config.txt
-  echo "!" >> /vrnetlab/config.txt
-fi
 
 	if [ -f /netlab/initial.cfg ]; then
 	  # netlab-generated initial.cfg may include its own "line vty" stanza. That can

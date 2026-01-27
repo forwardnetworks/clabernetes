@@ -143,6 +143,11 @@ func (c *clabernetes) startup() {
 		go c.startPodNetGuardian()
 	}
 
+	// For vrnetlab nodes in native mode, Forward expects to SSH to the pod IP.
+	// Start an in-pod TCP proxy on port 22 that forwards to the internal vrnetlab
+	// management IP assigned by our bootstrap script.
+	c.maybeStartVrnetlabSSHProxy()
+
 	c.connectivity()
 
 	if os.Getenv(clabernetesconstants.LauncherNativeModeEnv) == clabernetesconstants.True &&
