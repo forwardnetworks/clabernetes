@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -27,12 +28,52 @@ func (c *clabernetes) maybeStartVrnetlabSSHProxy() {
 		return
 	}
 
+	// vrnetlab uses iouyap/qemu user-space networking which does not handle
+	// CHECKSUM_PARTIAL / TSO/GSO packets well on veth pairs. Disable offloads on
+	// the internal management veth to ensure TCP (SSH) works reliably.
+	c.disableInterfaceOffloads("vrl-mgmt0")
+	c.disableInterfaceOffloads("vrl-mgmt1")
+
 	go func() {
 		if err := runTCPProxy(c.ctx, sshProxyListenAddr, vrnetlabMgmtSSHAddr); err != nil {
 			c.logger.Warnf("vrnetlab ssh proxy failed: %s", err)
 		}
 	}()
 	c.logger.Infof("vrnetlab ssh proxy enabled: %s -> %s", sshProxyListenAddr, vrnetlabMgmtSSHAddr)
+}
+
+func (c *clabernetes) disableInterfaceOffloads(iface string) {
+	if iface == "" {
+		return
+	}
+	_, err := exec.LookPath("ethtool")
+	if err != nil {
+		c.logger.Warnf("ethtool not found; cannot disable offloads on %s", iface)
+		return
+	}
+
+	// Best-effort: ethtool may return non-zero if the interface doesn't exist yet,
+	// or if an offload is not supported. We don't want to fail the pod for that.
+	cmd := exec.CommandContext(
+		c.ctx,
+		"ethtool",
+		"-K",
+		iface,
+		"tx",
+		"off",
+		"tso",
+		"off",
+		"gso",
+		"off",
+		"gro",
+		"off",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		c.logger.Warnf("failed disabling offloads on %s: %v (%s)", iface, err, strings.TrimSpace(string(out)))
+		return
+	}
+	c.logger.Infof("disabled offloads on %s", iface)
 }
 
 func runTCPProxy(ctx context.Context, listenAddr, targetAddr string) error {
