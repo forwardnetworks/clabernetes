@@ -31,6 +31,11 @@ func (c *clabernetes) maybeStartVrnetlabSSHProxy() {
 	// vrnetlab uses iouyap/qemu user-space networking which does not handle
 	// CHECKSUM_PARTIAL / TSO/GSO packets well on veth pairs. Disable offloads on
 	// the internal management veth to ensure TCP (SSH) works reliably.
+	//
+	// The veth pair is created by the vrnetlab bootstrap script in a sibling
+	// container, so we may need to wait briefly for it to exist.
+	_ = c.waitForInterface("vrl-mgmt0", 30*time.Second)
+	_ = c.waitForInterface("vrl-mgmt1", 30*time.Second)
 	c.disableInterfaceOffloads("vrl-mgmt0")
 	c.disableInterfaceOffloads("vrl-mgmt1")
 
@@ -40,6 +45,24 @@ func (c *clabernetes) maybeStartVrnetlabSSHProxy() {
 		}
 	}()
 	c.logger.Infof("vrnetlab ssh proxy enabled: %s -> %s", sshProxyListenAddr, vrnetlabMgmtSSHAddr)
+}
+
+func (c *clabernetes) waitForInterface(iface string, timeout time.Duration) error {
+	if iface == "" {
+		return nil
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout waiting for %s", iface)
+		}
+		// ip link show dev <iface>
+		cmd := exec.CommandContext(c.ctx, "ip", "link", "show", "dev", iface)
+		if err := cmd.Run(); err == nil {
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 func (c *clabernetes) disableInterfaceOffloads(iface string) {
