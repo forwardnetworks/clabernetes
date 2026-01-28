@@ -32,10 +32,12 @@ func (c *clabernetes) maybeStartVrnetlabSSHProxy() {
 	// CHECKSUM_PARTIAL / TSO/GSO packets well on veth pairs. Disable offloads on
 	// the internal management veth to ensure TCP (SSH) works reliably.
 	//
-	// The veth pair is created by the vrnetlab bootstrap script in a sibling
-	// container, so we may need to wait briefly for it to exist.
-	_ = c.waitForInterface("vrl-mgmt0", 30*time.Second)
-	_ = c.waitForInterface("vrl-mgmt1", 30*time.Second)
+	// Ensure the veth exists early (before vrnetlab starts) so we can disable
+	// offloads deterministically. The vrnetlab bootstrap script is idempotent and
+	// will reuse the same interface names.
+	if err := c.ensureVrnetlabMgmtVeth(); err != nil {
+		c.logger.Warnf("failed ensuring vrnetlab mgmt veth: %v", err)
+	}
 	c.disableInterfaceOffloads("vrl-mgmt0")
 	c.disableInterfaceOffloads("vrl-mgmt1")
 
@@ -47,22 +49,39 @@ func (c *clabernetes) maybeStartVrnetlabSSHProxy() {
 	c.logger.Infof("vrnetlab ssh proxy enabled: %s -> %s", sshProxyListenAddr, vrnetlabMgmtSSHAddr)
 }
 
-func (c *clabernetes) waitForInterface(iface string, timeout time.Duration) error {
-	if iface == "" {
-		return nil
-	}
-	deadline := time.Now().Add(timeout)
-	for {
-		if time.Now().After(deadline) {
-			return fmt.Errorf("timeout waiting for %s", iface)
+func (c *clabernetes) ensureVrnetlabMgmtVeth() error {
+	// vrl-mgmt0 (host side): 169.254.100.1/30
+	// vrl-mgmt1 (ios side): used by iouyap as Ethernet0/0
+	const (
+		hostDev   = "vrl-mgmt0"
+		iosDev    = "vrl-mgmt1"
+		hostCIDR  = "169.254.100.1/30"
+		checkWait = 50 * time.Millisecond
+		checkMax  = 40 // 2s total
+	)
+
+	// If already exists, just make sure it is up + has address.
+	if err := exec.CommandContext(c.ctx, "ip", "link", "show", "dev", hostDev).Run(); err != nil {
+		if out, err2 := exec.CommandContext(c.ctx, "ip", "link", "add", hostDev, "type", "veth", "peer", "name", iosDev).CombinedOutput(); err2 != nil {
+			return fmt.Errorf("ip link add %s/%s: %v (%s)", hostDev, iosDev, err2, strings.TrimSpace(string(out)))
 		}
-		// ip link show dev <iface>
-		cmd := exec.CommandContext(c.ctx, "ip", "link", "show", "dev", iface)
-		if err := cmd.Run(); err == nil {
-			return nil
-		}
-		time.Sleep(200 * time.Millisecond)
 	}
+
+	// Wait briefly for both ends to appear (race with kernel).
+	for i := 0; i < checkMax; i++ {
+		hostOK := exec.CommandContext(c.ctx, "ip", "link", "show", "dev", hostDev).Run() == nil
+		iosOK := exec.CommandContext(c.ctx, "ip", "link", "show", "dev", iosDev).Run() == nil
+		if hostOK && iosOK {
+			break
+		}
+		time.Sleep(checkWait)
+	}
+
+	// Ensure address on hostDev (ignore if already exists).
+	_ = exec.CommandContext(c.ctx, "ip", "addr", "add", hostCIDR, "dev", hostDev).Run()
+	_ = exec.CommandContext(c.ctx, "ip", "link", "set", hostDev, "up").Run()
+	_ = exec.CommandContext(c.ctx, "ip", "link", "set", iosDev, "up").Run()
+	return nil
 }
 
 func (c *clabernetes) disableInterfaceOffloads(iface string) {
