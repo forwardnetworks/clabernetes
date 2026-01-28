@@ -32,10 +32,12 @@ type podNetAddr struct {
 }
 
 type podNetRoute struct {
-	Dst     string `json:"dst"`
-	Gateway string `json:"gateway,omitempty"`
-	Dev     string `json:"dev,omitempty"`
-	Scope   string `json:"scope,omitempty"`
+	Dst     string   `json:"dst"`
+	Gateway string   `json:"gateway,omitempty"`
+	Dev     string   `json:"dev,omitempty"`
+	Scope   string   `json:"scope,omitempty"`
+	Flags   []string `json:"flags,omitempty"`
+	Metric  int      `json:"metric,omitempty"`
 }
 
 func (c *clabernetes) capturePodNetSnapshot(ctx context.Context) error {
@@ -170,6 +172,18 @@ func readPodNetSnapshotFromKernel(ctx context.Context, ifname string) (*podNetSn
 		gw, _ := r["gateway"].(string)
 		dev, _ := r["dev"].(string)
 		scope, _ := r["scope"].(string)
+		var flags []string
+		if flagsAny, ok := r["flags"].([]any); ok {
+			for _, fAny := range flagsAny {
+				if f, ok := fAny.(string); ok && f != "" {
+					flags = append(flags, f)
+				}
+			}
+		}
+		metric := 0
+		if mAny, ok := r["metric"].(float64); ok {
+			metric = int(mAny)
+		}
 
 		// Preserve only eth0 routes and defaults; avoid capturing host-only routes added by NOS.
 		if dev != "" && dev != ifname {
@@ -184,6 +198,8 @@ func readPodNetSnapshotFromKernel(ctx context.Context, ifname string) (*podNetSn
 			Gateway: gw,
 			Dev:     dev,
 			Scope:   scope,
+			Flags:   flags,
+			Metric:  metric,
 		})
 	}
 
@@ -214,18 +230,59 @@ func applyPodNetSnapshot(ctx context.Context, snap *podNetSnapshot) error {
 	}
 
 	// Restore routes.
+	//
+	// Important: on /32 pod IP setups (including our Cilium config), the default route is valid only
+	// after a link-scope host route to the gateway exists (ip -j route show: a route with dst=<gw>,
+	// dev=eth0, scope=link). If we try to restore the default route first, "ip route replace default
+	// via <gw> dev eth0" fails with exit status 2 ("invalid gateway").
+	//
+	// To avoid that, restore "no gateway" routes first, then routes that include a gateway.
+	noGatewayRoutes := make([]podNetRoute, 0, len(snap.Routes))
+	withGatewayRoutes := make([]podNetRoute, 0, len(snap.Routes))
 	for _, r := range snap.Routes {
 		if r.Dst == "" {
 			continue
 		}
+		if r.Gateway == "" {
+			noGatewayRoutes = append(noGatewayRoutes, r)
+		} else {
+			withGatewayRoutes = append(withGatewayRoutes, r)
+		}
+	}
+
+	applyRoute := func(r podNetRoute) error {
 		args := []string{"route", "replace", r.Dst}
 		if r.Gateway != "" {
 			args = append(args, "via", r.Gateway)
 		}
 		args = append(args, "dev", snap.Interface)
+		if r.Scope != "" {
+			args = append(args, "scope", r.Scope)
+		}
+		if r.Metric > 0 {
+			args = append(args, "metric", fmt.Sprintf("%d", r.Metric))
+		}
+		for _, f := range r.Flags {
+			if f == "onlink" {
+				args = append(args, "onlink")
+				break
+			}
+		}
 		cmd := exec.CommandContext(ctx, "ip", args...) //nolint:gosec
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("ip %v: %w", args, err)
+		}
+		return nil
+	}
+
+	for _, r := range noGatewayRoutes {
+		if err := applyRoute(r); err != nil {
+			return err
+		}
+	}
+	for _, r := range withGatewayRoutes {
+		if err := applyRoute(r); err != nil {
+			return err
 		}
 	}
 
