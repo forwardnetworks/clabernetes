@@ -1410,7 +1410,7 @@ func (r *DeploymentReconciler) renderDeploymentDevices(
 	mounts := []k8scorev1.VolumeMount{
 		{
 			Name:      "dev-kvm",
-			ReadOnly:  true,
+			ReadOnly:  false,
 			MountPath: "/dev/kvm",
 		},
 		{
@@ -1420,7 +1420,7 @@ func (r *DeploymentReconciler) renderDeploymentDevices(
 		},
 		{
 			Name:      "dev-net-tun",
-			ReadOnly:  true,
+			ReadOnly:  false,
 			MountPath: "/dev/net/tun",
 		},
 	}

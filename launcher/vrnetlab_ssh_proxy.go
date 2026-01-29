@@ -26,8 +26,8 @@ func (c *clabernetes) maybeStartVrnetlabSSHProxy() {
 		return
 	}
 
-	img := strings.ToLower(strings.TrimSpace(c.imageName))
-	if img == "" || !strings.Contains(img, "/vrnetlab/") {
+	kind := strings.ToLower(strings.TrimSpace(c.nodeKind))
+	if kind != "cisco_iol" && kind != "cisco_ioll2" {
 		return
 	}
 

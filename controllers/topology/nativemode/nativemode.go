@@ -66,6 +66,8 @@ func ApplyNativeModeOverrides(log claberneteslogging.Instance, in *ApplyInput) {
 		// other kinds are handled elsewhere or require no special native-mode changes
 	}
 
+	applyVrnetlabQemuNative(in)
+
 	applyCommandOverride(in)
 
 	// Ensure deterministic ordering for stable reconciles.
