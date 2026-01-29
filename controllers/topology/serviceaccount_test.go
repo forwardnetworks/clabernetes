@@ -87,6 +87,7 @@ func TestRenderServiceAccount(t *testing.T) {
 				reconciler := clabernetescontrollerstopology.NewServiceAccountReconciler(
 					&claberneteslogging.FakeInstance{},
 					nil,
+					nil,
 					clabernetesconfig.GetFakeManager,
 				)
 

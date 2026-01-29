@@ -44,6 +44,7 @@ func NewController(
 		TopologyReconciler: NewReconciler(
 			baseController.Log,
 			baseController.Client,
+			clabernetes.GetCtrlRuntimeMgr().GetAPIReader(),
 			clabernetes.GetAppName(),
 			clabernetes.GetNamespace(),
 			clabernetes.GetClusterCRIKind(),

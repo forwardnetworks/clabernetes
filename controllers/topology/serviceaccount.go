@@ -27,6 +27,7 @@ func launcherServiceAccountName() string {
 type ServiceAccountReconciler struct {
 	log                 claberneteslogging.Instance
 	client              ctrlruntimeclient.Client
+	reader              ctrlruntimeclient.Reader
 	configManagerGetter clabernetesconfig.ManagerGetterFunc
 }
 
@@ -34,11 +35,17 @@ type ServiceAccountReconciler struct {
 func NewServiceAccountReconciler(
 	log claberneteslogging.Instance,
 	client ctrlruntimeclient.Client,
+	reader ctrlruntimeclient.Reader,
 	configManagerGetter clabernetesconfig.ManagerGetterFunc,
 ) *ServiceAccountReconciler {
+	if reader == nil {
+		reader = client
+	}
+
 	return &ServiceAccountReconciler{
 		log:                 log,
 		client:              client,
+		reader:              reader,
 		configManagerGetter: configManagerGetter,
 	}
 }
@@ -128,10 +135,32 @@ func (r *ServiceAccountReconciler) Render(
 		},
 	}
 
+	// If the topology specifies pull secrets, apply them as Kubernetes imagePullSecrets so
+	// the launcher (and init) images can be pulled in clusters where the registry is private.
+	if len(owningTopology.Spec.ImagePull.PullSecrets) > 0 {
+		renderedServiceAccount.ImagePullSecrets = make([]k8scorev1.LocalObjectReference, 0, len(owningTopology.Spec.ImagePull.PullSecrets))
+		for _, name := range owningTopology.Spec.ImagePull.PullSecrets {
+			if name == "" {
+				continue
+			}
+			renderedServiceAccount.ImagePullSecrets = append(
+				renderedServiceAccount.ImagePullSecrets,
+				k8scorev1.LocalObjectReference{Name: name},
+			)
+		}
+	}
+
 	// when we render we want to include any existing owner references as rolebindings (and sa) are
 	// owned by all topologies in a given namespace, so make sure to retain those
 	if existingServieAccount != nil {
 		renderedServiceAccount.OwnerReferences = existingServieAccount.GetOwnerReferences()
+		// Preserve any pre-provisioned pull secrets (for private launcher images) when the
+		// topology didn't explicitly specify secrets, and preserve any other secrets fields that
+		// might be managed externally.
+		if len(renderedServiceAccount.ImagePullSecrets) == 0 {
+			renderedServiceAccount.ImagePullSecrets = existingServieAccount.ImagePullSecrets
+		}
+		renderedServiceAccount.Secrets = existingServieAccount.Secrets
 	}
 
 	return renderedServiceAccount
@@ -157,8 +186,27 @@ func (r *ServiceAccountReconciler) Conforms(
 		return false
 	}
 
+	// If we expect image pull secrets, ensure the existing service account contains them.
+	if len(renderedServiceAccount.ImagePullSecrets) > 0 {
+		existing := make(map[string]struct{}, len(existingServiceAccount.ImagePullSecrets))
+		for _, s := range existingServiceAccount.ImagePullSecrets {
+			if s.Name == "" {
+				continue
+			}
+			existing[s.Name] = struct{}{}
+		}
+		for _, s := range renderedServiceAccount.ImagePullSecrets {
+			if s.Name == "" {
+				continue
+			}
+			if _, ok := existing[s.Name]; !ok {
+				return false
+			}
+		}
+	}
+
 	// we need to check to make sure that *at least* our topology exists as an owner for this
-	if len(existingServiceAccount.ObjectMeta.OwnerReferences) == 1 {
+	if len(existingServiceAccount.ObjectMeta.OwnerReferences) < 1 {
 		// we should have *at least* one owner reference
 		return false
 	}
@@ -184,7 +232,7 @@ func (r *ServiceAccountReconciler) reconcileGetAndCreateIfNotExist( //nolint:dup
 
 	existingServiceAccount := &k8scorev1.ServiceAccount{}
 
-	err := r.client.Get(
+	err := r.reader.Get(
 		ctx,
 		apimachinerytypes.NamespacedName{
 			Namespace: namespace,
@@ -218,6 +266,22 @@ func (r *ServiceAccountReconciler) reconcileGetAndCreateIfNotExist( //nolint:dup
 
 		err = r.client.Create(ctx, renderedServiceAccount)
 		if err != nil {
+			if apimachineryerrors.IsAlreadyExists(err) {
+				// A race (informer cache staleness, concurrent creator, etc.) can surface as NotFound
+				// followed by AlreadyExists. Treat this as success and return the existing object.
+				getErr := r.reader.Get(
+					ctx,
+					apimachinerytypes.NamespacedName{
+						Namespace: namespace,
+						Name:      launcherServiceAccountName(),
+					},
+					existingServiceAccount,
+				)
+				if getErr == nil {
+					return existingServiceAccount, nil
+				}
+				return existingServiceAccount, getErr
+			}
 			r.log.Criticalf(
 				"failed creating service account in namespace %q, error: %s",
 				namespace,
@@ -227,7 +291,7 @@ func (r *ServiceAccountReconciler) reconcileGetAndCreateIfNotExist( //nolint:dup
 			return existingServiceAccount, err
 		}
 
-		return existingServiceAccount, nil
+		return renderedServiceAccount, nil
 	}
 
 	r.log.Debugf(

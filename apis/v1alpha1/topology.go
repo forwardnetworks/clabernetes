@@ -64,8 +64,8 @@ type TopologySpec struct {
 	// Connectivity defines the type of connectivity to use between nodes in the topology. The
 	// default behavior is to use vxlan tunnels, alternatively you can enable a more experimental
 	// "slurpeeth" connectivity flavor that stuffs traffic into tcp tunnels to avoid any vxlan mtu
-	// and/or fragmentation challenges.
-	// +kubebuilder:validation:Enum=vxlan;slurpeeth
+	// and/or fragmentation challenges, or "multus" to use multus cni for connectivity.
+	// +kubebuilder:validation:Enum=vxlan;slurpeeth;multus
 	// +kubebuilder:default=vxlan
 	Connectivity string `json:"connectivity,omitempty"`
 }

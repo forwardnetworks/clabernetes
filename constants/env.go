@@ -93,6 +93,16 @@ const (
 	// should run (vxlan/slurpeeth).
 	LauncherConnectivityKind = "LAUNCHER_CONNECTIVITY_KIND"
 
+	// LauncherTunnelsFileEnv is an optional env var that points to a file containing the
+	// per-node tunnels (JSON array of PointToPointTunnel objects). This is used to avoid
+	// requiring Kubernetes API connectivity from inside the launcher at runtime (native mode
+	// NOS containers may mutate the pod's routing table).
+	LauncherTunnelsFileEnv = "LAUNCHER_TUNNELS_FILE"
+
+	// LauncherNativeModeEnv is the env var that holds whether the launcher is running in native
+	// mode (sidecar).
+	LauncherNativeModeEnv = "LAUNCHER_NATIVE_MODE"
+
 	// LauncherContainerlabVersion is the env var that holds the possibly user specified version of
 	// containerlab to download and use in the launcher.
 	LauncherContainerlabVersion = "LAUNCHER_CONTAINERLAB_VERSION"

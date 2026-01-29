@@ -227,6 +227,18 @@ type LinkDefinition struct {
 	LinkConfig `yaml:",inline"`
 
 	Type string `yaml:"type,omitempty"`
+	// Endpoint represents a single-ended link definition used by containerlab for
+	// "dummy" links.
+	//
+	// Example:
+	//   type: dummy
+	//   endpoint:
+	//     node: r1
+	//     interface: et1
+	//
+	// When present, this can be converted into an Endpoints entry of the form
+	// "<node>:<interface>".
+	Endpoint map[string]string `yaml:"endpoint,omitempty"`
 }
 
 // LinkConfig is the vendor'd (ish) clab link config object.

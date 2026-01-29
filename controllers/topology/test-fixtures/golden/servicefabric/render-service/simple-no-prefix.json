@@ -2,7 +2,6 @@
     "metadata": {
         "name": "srl1-vx",
         "namespace": "clabernetes",
-        "creationTimestamp": null,
         "labels": {
             "clabernetes/app": "clabernetes",
             "clabernetes/name": "srl1",
@@ -17,8 +16,8 @@
             {
                 "name": "vxlan",
                 "protocol": "UDP",
-                "port": 14789,
-                "targetPort": 14789
+                "port": 6784,
+                "targetPort": 6784
             },
             {
                 "name": "slurpeeth",

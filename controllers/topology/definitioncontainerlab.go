@@ -633,10 +633,48 @@ func (p *containerlabDefinitionProcessor) processLinksForNodeGroup(
 	removeTopologyPrefix bool,
 ) error {
 	for _, link := range containerlabConfig.Topology.Links {
+		// Support containerlab single-ended dummy links (netlab uses these to model unused ports).
+		//
+		// Netlab emits:
+		//   - type: dummy
+		//     endpoint: { node: r1, interface: et1 }
+		//
+		// Our vendor'd link type stores that under LinkDefinition.Endpoint, so convert it to a
+		// single Endpoints entry for this node.
+		if strings.EqualFold(link.Type, "dummy") && len(link.Endpoints) == 0 && link.Endpoint != nil {
+			node := strings.TrimSpace(link.Endpoint["node"])
+			ifName := strings.TrimSpace(link.Endpoint["interface"])
+			if node != "" && ifName != "" {
+				link.Endpoints = []string{fmt.Sprintf("%s:%s", node, ifName)}
+			}
+		}
+
+		// Handle one-ended dummy link for this node without overlay tunnels.
+		if strings.EqualFold(link.Type, "dummy") && len(link.Endpoints) == 1 {
+			endpointParts := strings.Split(link.Endpoints[0], ":")
+			if len(endpointParts) != clabernetesapisv1alpha1.LinkEndpointElementCount {
+				msg := fmt.Sprintf(
+					"endpoint '%q' has wrong syntax, bad endpoint:interface config", link.Endpoints,
+				)
+				p.logger.Critical(msg)
+				return fmt.Errorf("%w: %s", claberneteserrors.ErrParse, msg)
+			}
+			endpoint := clabernetesapisv1alpha1.LinkEndpoint{
+				NodeName:      endpointParts[0],
+				InterfaceName: endpointParts[1],
+			}
+			if endpoint.NodeName == primaryNodeName {
+				p.reconcileData.ResolvedConfigs[primaryNodeName].Topology.Links = append(
+					p.reconcileData.ResolvedConfigs[primaryNodeName].Topology.Links,
+					link,
+				)
+			}
+			continue
+		}
+
 		endpoints, err := parseLinkEndpoints(link)
 		if err != nil {
 			p.logger.Critical(err.Error())
-
 			return err
 		}
 

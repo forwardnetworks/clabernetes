@@ -19,6 +19,8 @@ import (
 	apimachineryerrors "k8s.io/apimachinery/pkg/api/errors"
 	apimachinerymeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	apimachinerytypes "k8s.io/apimachinery/pkg/types"
 	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlruntimeutil "sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -36,6 +38,7 @@ type Reconciler struct {
 	roleBindingReconciler    *RoleBindingReconciler
 	configMapReconciler      *ConfigMapReconciler
 	connectivityReconciler   *ConnectivityReconciler
+	nadReconciler            *NetworkAttachmentDefinitionReconciler
 
 	// these ones are exposed for testing purposes. no reason to not expose them really anyway so
 	// no big deal. not exposing the others at this point since there isnt a reason to (yet, but
@@ -50,6 +53,7 @@ type Reconciler struct {
 func NewReconciler(
 	log claberneteslogging.Instance,
 	client ctrlruntimeclient.Client,
+	reader ctrlruntimeclient.Reader,
 	managerAppName,
 	managerNamespace,
 	criKind string,
@@ -61,6 +65,7 @@ func NewReconciler(
 		serviceAccountReconciler: NewServiceAccountReconciler(
 			log,
 			client,
+			reader,
 			configManagerGetter,
 		),
 		roleBindingReconciler: NewRoleBindingReconciler(
@@ -74,6 +79,10 @@ func NewReconciler(
 			configManagerGetter,
 		),
 		connectivityReconciler: NewConnectivityReconciler(
+			log,
+			configManagerGetter,
+		),
+		nadReconciler: NewNetworkAttachmentDefinitionReconciler(
 			log,
 			configManagerGetter,
 		),
@@ -771,7 +780,14 @@ func (r *Reconciler) ReconcileDeployments( //nolint: gocyclo,funlen
 	r.Log.Info("processing deployment statuses")
 
 	for nodeName, deployment := range deployments.Current {
-		if deployment.Status.ReadyReplicas == 1 {
+		ready := deployment.Status.ReadyReplicas == 1
+		if !ready {
+			// Some Kubernetes distributions/versions may omit Deployment.Status replica counters
+			// even when the underlying Pod is Ready. Fall back to checking the Pod Ready condition.
+			ready = r.isNodePodReady(ctx, owningTopology, nodeName)
+		}
+
+		if ready {
 			reconcileData.NodeStatuses[nodeName] = clabernetesconstants.NodeStatusReady
 		} else {
 			reconcileData.NodeStatuses[nodeName] = clabernetesconstants.NodeStatusNotReady //nolint:lll
@@ -930,6 +946,143 @@ func (r *Reconciler) reconcileDeploymentsHandleRestarts(
 	}
 
 	return restartNodeError
+}
+
+// ReconcileNetworkAttachmentDefinitions reconciles the network attachment definitions for the
+// topology.
+func (r *Reconciler) ReconcileNetworkAttachmentDefinitions(
+	ctx context.Context,
+	owningTopology *clabernetesapisv1alpha1.Topology,
+	reconcileData *ReconcileData,
+) error {
+	if owningTopology.Spec.Connectivity != clabernetesconstants.ConnectivityMultus {
+		return nil
+	}
+
+	nadTypeName := "network-attachment-definition"
+
+	// NOTE: controller-runtime requires Unstructured objects/lists to have GVK set for List operations.
+	nadGVK := schema.GroupVersionKind{Group: "k8s.cni.cncf.io", Version: "v1", Kind: "NetworkAttachmentDefinition"}
+	nad := &unstructured.Unstructured{}
+	nad.SetGroupVersionKind(nadGVK)
+	nadList := &unstructured.UnstructuredList{}
+	nadList.SetGroupVersionKind(schema.GroupVersionKind{Group: nadGVK.Group, Version: nadGVK.Version, Kind: "NetworkAttachmentDefinitionList"})
+	// Some controller-runtime versions also require apiVersion/kind present in the backing object map.
+	if nadList.Object == nil {
+		nadList.Object = map[string]any{}
+	}
+	nadList.Object["apiVersion"] = nadGVK.Group + "/" + nadGVK.Version
+	nadList.Object["kind"] = "NetworkAttachmentDefinitionList"
+
+	nads, err := ReconcileResolve(
+		ctx,
+		r,
+		nad,
+		nadList,
+		nadTypeName,
+		owningTopology,
+		reconcileData.ResolvedConfigs,
+		r.nadReconciler.Resolve,
+	)
+	if err != nil {
+		return err
+	}
+
+	for _, extraNAD := range nads.Extra {
+		err = r.deleteObj(
+			ctx,
+			extraNAD,
+			nadTypeName,
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	renderedMissingNADs := r.nadReconciler.RenderAll(
+		owningTopology,
+		nads.Missing,
+	)
+
+	for _, renderedMissingNAD := range renderedMissingNADs {
+		err = r.createObj(
+			ctx,
+			owningTopology,
+			renderedMissingNAD,
+			nadTypeName,
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	for _, existingCurrentNAD := range nads.Current {
+		renderedCurrentNAD := r.nadReconciler.Render(
+			owningTopology,
+			existingCurrentNAD.GetName(),
+		)
+
+		err = ctrlruntimeutil.SetOwnerReference(
+			owningTopology,
+			renderedCurrentNAD,
+			r.Client.Scheme(),
+		)
+		if err != nil {
+			return err
+		}
+
+		if !r.nadReconciler.Conforms(
+			existingCurrentNAD,
+			renderedCurrentNAD,
+			owningTopology.GetUID(),
+		) {
+			err = r.updateObj(
+				ctx,
+				renderedCurrentNAD,
+				nadTypeName,
+			)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (r *Reconciler) isNodePodReady(
+	ctx context.Context,
+	owningTopology *clabernetesapisv1alpha1.Topology,
+	nodeName string,
+) bool {
+	if owningTopology == nil {
+		return false
+	}
+
+	pods := &k8scorev1.PodList{}
+	err := r.Client.List(
+		ctx,
+		pods,
+		ctrlruntimeclient.InNamespace(owningTopology.GetNamespace()),
+		ctrlruntimeclient.MatchingLabels{
+			clabernetesconstants.LabelTopologyOwner: owningTopology.GetName(),
+			clabernetesconstants.LabelTopologyNode:  nodeName,
+		},
+	)
+	if err != nil {
+		return false
+	}
+
+	for i := range pods.Items {
+		for j := range pods.Items[i].Status.Conditions {
+			cond := pods.Items[i].Status.Conditions[j]
+			if cond.Type == k8scorev1.PodReady && cond.Status == k8scorev1.ConditionTrue {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 func (r *Reconciler) diffIfDebug(a, b any) {

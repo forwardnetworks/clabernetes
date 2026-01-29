@@ -38,6 +38,13 @@ cover.out
 # direnv file
 .envrc
 
+# local build artifacts (do not commit)
+clabernetes
+clabernetes-bin
+clabverter-bin
+GEMINI.md
+bin/
+
 # goreleaser dist dir for testing builds and such locally
 .dist/
 

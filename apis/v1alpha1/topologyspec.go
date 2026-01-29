@@ -147,6 +147,13 @@ type Deployment struct {
 	// to "scheduling" things (affinity/node selector/tolerations).
 	// +optional
 	Scheduling Scheduling `json:"scheduling"`
+	// NativeMode, when true, tells clabernetes to attempt to run the node image directly as a
+	// container in the pod rather than inside a docker-in-docker setup. This is experimental!
+	// +optional
+	NativeMode *bool `json:"nativeMode"`
+	// HostNetwork, when true, sets the pod to use the host network.
+	// +optional
+	HostNetwork *bool `json:"hostNetwork"`
 	// PrivilegedLauncher, when true, sets the launcher containers to privileged. Historically we
 	// tried very hard to *not* need to set privileged mode on pods, however the reality is it is
 	// much, much easier to get various network operating system images booting with this enabled,
@@ -225,6 +232,9 @@ type Scheduling struct {
 	// Topology.
 	// +optional
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+	// Affinity configures pod affinity/anti-affinity and node affinity for launcher pods.
+	// +optional
+	Affinity *k8scorev1.Affinity `json:"affinity,omitempty"`
 	// Tolerations is a list of Tolerations that will be set on the launcher pod spec.
 	// +listType=atomic
 	// +optional

@@ -84,6 +84,8 @@ spec:
         filePath: srl2.license
         mode: read
     filesFromURL: null
+    hostNetwork: null
+    nativeMode: null
     persistence:
       enabled: false
     privilegedLauncher: null

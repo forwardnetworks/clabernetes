@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	clabernetesgeneratedclientset "github.com/srl-labs/clabernetes/generated/clientset"
 	claberneteslogging "github.com/srl-labs/clabernetes/logging"
 	clabernetesutil "github.com/srl-labs/clabernetes/util"
+	clabernetesutilcontainerlab "github.com/srl-labs/clabernetes/util/containerlab"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -27,6 +29,20 @@ const (
 
 // StartClabernetes is a function that starts the clabernetes launcher. It cannot fail, only panic.
 func StartClabernetes() {
+	c := newClabernetes()
+
+	c.startup()
+}
+
+// StartClabernetesSetup is a function that starts the clabernetes launcher in setup mode (for init
+// containers). It cannot fail, only panic.
+func StartClabernetesSetup() {
+	c := newClabernetes()
+
+	c.setupOnly()
+}
+
+func newClabernetes() *clabernetes {
 	if clabernetesInstance != nil {
 		clabernetesutil.Panic("clabernetes instance already created...")
 	}
@@ -73,7 +89,7 @@ func StartClabernetes() {
 		imagePullThroughMode: os.Getenv(clabernetesconstants.LauncherImagePullThroughModeEnv),
 	}
 
-	clabernetesInstance.startup()
+	return clabernetesInstance
 }
 
 var clabernetesInstance *clabernetes //nolint:gochecknoglobals
@@ -109,19 +125,135 @@ func (c *clabernetes) startup() {
 
 	c.containerlabVersion()
 	c.setup()
-	c.image()
-	c.launch()
+
+	if os.Getenv(clabernetesconstants.LauncherNativeModeEnv) != clabernetesconstants.True {
+		c.image()
+		c.launch()
+
+		go c.imageCleanup()
+		go c.watchContainers()
+	} else {
+		c.logger.Info("native mode enabled, skipping docker image loading and container launch")
+	}
+
+	// In native mode, some NOS containers mutate routes in the shared pod netns.
+	// Keep the pod/CNI routes alive so connectivity tools (vxlan/slurpeeth) can reach
+	// remote tunnel endpoints.
+	if os.Getenv(clabernetesconstants.LauncherNativeModeEnv) == clabernetesconstants.True {
+		go c.startPodNetGuardian()
+	}
+
+	// For vrnetlab nodes in native mode, Forward expects to SSH to the pod IP.
+	// Start an in-pod TCP proxy on port 22 that forwards to the internal vrnetlab
+	// management IP assigned by our bootstrap script.
+	c.maybeStartVrnetlabSSHProxy()
+
 	c.connectivity()
 
-	go c.imageCleanup()
+	if os.Getenv(clabernetesconstants.LauncherNativeModeEnv) == clabernetesconstants.True &&
+		os.Getenv(clabernetesconstants.LauncherConnectivityKind) == clabernetesconstants.ConnectivityMultus {
+		c.renameInterfaces()
+	}
+
 	go c.runProbes()
-	go c.watchContainers()
 
 	c.logger.Info("running for forever or until sigint...")
 
 	<-c.ctx.Done()
 
 	claberneteslogging.GetManager().Flush()
+}
+
+func (c *clabernetes) setupOnly() {
+	c.logger.Info("starting clabernetes setup...")
+
+	c.logger.Debugf("clabernetes version %s", clabernetesconstants.Version)
+
+	c.containerlabVersion()
+	c.setup()
+
+	// Snapshot the pod network state during init (before NOS starts). In native mode,
+	// some NOS containers can mutate shared pod routes; the launcher will re-apply
+	// these as needed at runtime.
+	if err := c.capturePodNetSnapshot(c.ctx); err != nil {
+		c.logger.Warnf("failed capturing pod net snapshot: %s", err)
+	}
+
+	// Cache tunnels during init-container setup so launch does not depend on Kubernetes API
+	// access from within the pod network namespace. Native-mode NOS containers can mutate
+	// routes on the shared pod netns, breaking access to the cluster Service CIDR.
+	err := c.cacheNodeTunnels()
+	if err != nil {
+		c.logger.Fatalf("failed caching tunnels content, err: %s", err)
+	}
+
+	c.logger.Info("clabernetes setup complete")
+
+	claberneteslogging.GetManager().Flush()
+}
+
+func (c *clabernetes) renameInterfaces() {
+	c.logger.Info("native mode + multus detected, renaming interfaces...")
+
+	rawConfig, err := os.ReadFile("/clabernetes/topo.clab.yaml")
+	if err != nil {
+		c.logger.Fatalf("failed reading topo.clab.yaml, err: %s", err)
+	}
+
+	config, err := clabernetesutilcontainerlab.LoadContainerlabConfig(string(rawConfig))
+	if err != nil {
+		c.logger.Fatalf("failed loading containerlab config, err: %s", err)
+	}
+
+	for idx, link := range config.Topology.Links {
+		if len(link.Endpoints) != 2 {
+			continue
+		}
+
+		var localInterface string
+
+		for _, endpoint := range link.Endpoints {
+			endpointParts := strings.Split(endpoint, ":")
+			if len(endpointParts) != 2 {
+				continue
+			}
+
+			if endpointParts[0] == c.nodeName {
+				localInterface = endpointParts[1]
+
+				break
+			}
+		}
+
+		if localInterface == "" {
+			continue
+		}
+
+		// multus adds interfaces as net1, net2, etc. starting from 1 (net0 is eth0 usually)
+		// we use idx+1 because the link index in our topology should match the multus
+		// insertion order.
+		multusInterface := fmt.Sprintf("net%d", idx+1)
+
+		c.logger.Infof("renaming interface %q to %q", multusInterface, localInterface)
+
+		updateCmd := exec.CommandContext(
+			c.ctx,
+			"ip",
+			"link",
+			"set",
+			multusInterface,
+			"name",
+			localInterface,
+		)
+
+		updateCmd.Stdout = c.logger
+		updateCmd.Stderr = c.logger
+
+		err = updateCmd.Run()
+		if err != nil {
+			c.logger.Warnf("failed renaming interface %q to %q, err: %s", multusInterface, localInterface, err)
+		}
+	}
 }
 
 func (c *clabernetes) containerlabVersion() {
@@ -153,45 +285,52 @@ func (c *clabernetes) setup() {
 		c.handleMounts()
 	}
 
-	if daemonConfigExists() {
-		c.logger.Infof("%q exists, skipping insecure registries", dockerDaemonConfig)
+	if os.Getenv(clabernetesconstants.LauncherNativeModeEnv) == clabernetesconstants.True {
+		c.logger.Info("native mode enabled, skipping docker setup")
 	} else {
-		c.logger.Debug("configure insecure registries if requested...")
+		if daemonConfigExists() {
+			c.logger.Infof("%q exists, skipping docker daemon configuration", dockerDaemonConfig)
+		} else {
+			c.logger.Debug("configuring docker daemon...")
 
-		err := handleInsecureRegistries()
-		if err != nil {
-			c.logger.Fatalf("failed configuring insecure docker registries, err: %s", err)
-		}
-	}
-
-	c.logger.Debug("ensuring docker is running...")
-
-	err := startDocker(c.ctx, c.logger)
-	if err != nil {
-		c.logger.Warn(
-			"failed ensuring docker is running, attempting to fallback to legacy ip tables",
-		)
-
-		// see https://github.com/srl-labs/clabernetes/issues/47
-		err = enableLegacyIPTables(c.ctx, c.logger)
-		if err != nil {
-			c.logger.Fatalf("failed enabling legacy ip tables, err: %s", err)
+			err := handleDockerDaemonConfig()
+			if err != nil {
+				c.logger.Fatalf("failed configuring docker daemon, err: %s", err)
+			}
 		}
 
-		err = startDocker(c.ctx, c.logger)
-		if err != nil {
-			c.logger.Fatalf("failed ensuring docker is running, err: %s", err)
-		}
+		c.logger.Debug("ensuring docker is running...")
 
-		c.logger.Warn("docker started, but using legacy ip tables")
+		err := startDocker(c.ctx, c.logger)
+		if err != nil {
+			c.logger.Warn(
+				"failed ensuring docker is running, attempting to fallback to legacy ip tables",
+			)
+
+			// see https://github.com/srl-labs/clabernetes/issues/47
+			err = enableLegacyIPTables(c.ctx, c.logger)
+			if err != nil {
+				c.logger.Fatalf("failed enabling legacy ip tables, err: %s", err)
+			}
+
+			err = startDocker(c.ctx, c.logger)
+			if err != nil {
+				c.logger.Fatalf("failed ensuring docker is running, err: %s", err)
+			}
+
+			c.logger.Warn("docker started, but using legacy ip tables")
+		}
 	}
 
 	c.logger.Debug("getting files from url if requested...")
 
-	err = c.getFilesFromURL()
+	err := c.getFilesFromURL()
 	if err != nil {
 		c.logger.Fatalf("failed getting file(s) from remote url, err: %s", err)
 	}
+
+	// NOTE: tunnel caching is performed in the init-container (setupOnly) so the launcher
+	// doesn't depend on in-pod access to the Kubernetes API at runtime.
 }
 
 func (c *clabernetes) launch() {

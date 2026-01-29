@@ -21,9 +21,9 @@ spec:
   ipFamilyPolicy: SingleStack
   ports:
     - name: vxlan
-      port: 14789
+      port: 6784
       protocol: UDP
-      targetPort: 14789
+      targetPort: 6784
     - name: slurpeeth
       port: 4799
       protocol: TCP

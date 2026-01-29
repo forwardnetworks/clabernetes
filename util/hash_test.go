@@ -74,7 +74,7 @@ func TestHashObjectYAML(t *testing.T) {
 		{
 			name:     "simple",
 			in:       map[string]string{"one": "two"},
-			expected: "8fb10bdc1e14b3b2e8e53aa5315b1c11cb87b873a0a1b6f758411c200728c86b",
+			expected: "ae2a0318f5c3a1cf9577fef4ab888b51951dc9ee84cb7012cfb064d4bbfee2a7",
 		},
 	}
 

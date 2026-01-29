@@ -1,6 +1,8 @@
 package topology
 
 import (
+	"crypto/sha1"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -30,6 +32,50 @@ const (
 	probeReadinessFailureThreshold      = 3
 	probeDefaultStartupFailureThreshold = 40
 )
+
+func sanitizeLinuxIfName(raw string) string {
+	// Linux interface names must be <= 15 bytes and cannot contain '/'.
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "link"
+	}
+	s = strings.ReplaceAll(s, "/", "-")
+	s = strings.ReplaceAll(s, ":", "-")
+	s = strings.ReplaceAll(s, " ", "-")
+
+	// Keep only [A-Za-z0-9_.-]
+	b := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+			b = append(b, c)
+		case c >= 'A' && c <= 'Z':
+			b = append(b, c)
+		case c >= '0' && c <= '9':
+			b = append(b, c)
+		case c == '_' || c == '-' || c == '.':
+			b = append(b, c)
+		default:
+			// drop
+		}
+	}
+	s = string(b)
+	if s == "" {
+		return "link"
+	}
+	if len(s) <= 15 {
+		return s
+	}
+
+	sum := sha1.Sum([]byte(s))           //nolint:gosec // non-crypto identifier
+	suffix := fmt.Sprintf("%x", sum[:3]) // 6 chars
+	prefixLen := 15 - 1 - len(suffix)
+	if prefixLen < 1 {
+		return suffix[:15]
+	}
+	return s[:prefixLen] + "-" + suffix
+}
 
 // DeploymentReconciler is a subcomponent of the "TopologyReconciler" but is exposed for testing
 // purposes. This is the component responsible for rendering/validating deployments for a
@@ -130,6 +176,7 @@ func (r *DeploymentReconciler) Render(
 		owningTopology.GetNamespace(),
 		owningTopologyName,
 		nodeName,
+		owningTopology,
 	)
 
 	r.renderDeploymentScheduling(
@@ -151,6 +198,23 @@ func (r *DeploymentReconciler) Render(
 		configVolumeName,
 		volumeMountsFromCommonSpec,
 		owningTopology,
+		clabernetesConfigs,
+	)
+
+	r.renderDeploymentNative(
+		deployment,
+		nodeName,
+		configVolumeName,
+		volumeMountsFromCommonSpec,
+		owningTopology,
+		clabernetesConfigs,
+	)
+
+	r.renderDeploymentMultus(
+		deployment,
+		owningTopology,
+		nodeName,
+		clabernetesConfigs,
 	)
 
 	r.renderDeploymentContainerEnv(
@@ -330,13 +394,25 @@ func (r *DeploymentReconciler) Conforms( //nolint: gocyclo
 func (r *DeploymentReconciler) DetermineNodesNeedingRestart(
 	reconcileData *ReconcileData,
 ) {
+	// When the rendered containerlab config changes, we have to restart nodes so
+	// the launcher realizes the updated config. Historically we tried to diff the
+	// unmarshaled config structs node-by-node, but because the "previous" configs
+	// are round-tripped through YAML (Topology status), benign serialization
+	// differences can cause endless restart loops.
+	//
+	// The config hash already captures real changes (and is stable), so use it as
+	// the gate for restarts and restart all existing nodes when it changes.
+	if reconcileData.PreviousHashes.Config == reconcileData.ResolvedHashes.Config {
+		return
+	}
+
 	for nodeName := range reconcileData.ResolvedConfigs {
 		_, nodeExistedBefore := reconcileData.PreviousConfigs[nodeName]
 		if !nodeExistedBefore {
 			continue
 		}
 
-		determineNodeNeedsRestart(reconcileData, nodeName)
+		reconcileData.NodesNeedingReboot.Add(nodeName)
 	}
 }
 
@@ -345,6 +421,7 @@ func (r *DeploymentReconciler) renderDeploymentBase(
 	namespace,
 	owningTopologyName,
 	nodeName string,
+	owningTopology *clabernetesapisv1alpha1.Topology,
 ) *k8sappsv1.Deployment {
 	annotations, globalLabels := r.configManagerGetter().GetAllMetadata()
 
@@ -366,7 +443,7 @@ func (r *DeploymentReconciler) renderDeploymentBase(
 		labels[k] = v
 	}
 
-	return &k8sappsv1.Deployment{
+	deployment := &k8sappsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        name,
 			Namespace:   namespace,
@@ -391,6 +468,7 @@ func (r *DeploymentReconciler) renderDeploymentBase(
 					Labels:      labels,
 				},
 				Spec: k8scorev1.PodSpec{
+					InitContainers:     []k8scorev1.Container{},
 					Containers:         []k8scorev1.Container{},
 					RestartPolicy:      "Always",
 					ServiceAccountName: launcherServiceAccountName(),
@@ -400,6 +478,16 @@ func (r *DeploymentReconciler) renderDeploymentBase(
 			},
 		},
 	}
+
+	if ResolveNativeMode(owningTopology) {
+		deployment.Spec.Template.Spec.ShareProcessNamespace = clabernetesutil.ToPointer(true)
+	}
+
+	if ResolveHostNetwork(owningTopology) {
+		deployment.Spec.Template.Spec.HostNetwork = true
+	}
+
+	return deployment
 }
 
 func (r *DeploymentReconciler) renderDeploymentScheduling(
@@ -409,6 +497,12 @@ func (r *DeploymentReconciler) renderDeploymentScheduling(
 	tolerations := owningTopology.Spec.Deployment.Scheduling.Tolerations
 
 	deployment.Spec.Template.Spec.Tolerations = tolerations
+	if owningTopology.Spec.Deployment.Scheduling.Affinity != nil {
+		deployment.Spec.Template.Spec.Affinity = owningTopology.Spec.Deployment.Scheduling.Affinity
+	}
+
+	// Nothing else to do for scheduling here; node placement is controlled by Topology scheduling
+	// config and cluster policies.
 }
 
 func (r *DeploymentReconciler) renderDeploymentVolumes( //nolint:funlen
@@ -657,7 +751,10 @@ func (r *DeploymentReconciler) renderDeploymentContainer(
 	configVolumeName string,
 	volumeMountsFromCommonSpec []k8scorev1.VolumeMount,
 	owningTopology *clabernetesapisv1alpha1.Topology,
+	clabernetesConfigs map[string]*clabernetesutilcontainerlab.Config,
 ) {
+	nativeMode := ResolveNativeMode(owningTopology)
+
 	image := owningTopology.Spec.Deployment.LauncherImage
 	if image == "" {
 		image = r.configManagerGetter().GetLauncherImage()
@@ -668,7 +765,7 @@ func (r *DeploymentReconciler) renderDeploymentContainer(
 		imagePullPolicy = r.configManagerGetter().GetLauncherImagePullPolicy()
 	}
 
-	container := k8scorev1.Container{
+	launcherContainer := k8scorev1.Container{
 		Name:       nodeName,
 		WorkingDir: "/clabernetes",
 		Image:      image,
@@ -715,9 +812,861 @@ func (r *DeploymentReconciler) renderDeploymentContainer(
 		ImagePullPolicy:          k8scorev1.PullPolicy(imagePullPolicy),
 	}
 
-	container.VolumeMounts = append(container.VolumeMounts, volumeMountsFromCommonSpec...)
+	// Avoid duplicate mountPaths when users provide filesFromConfigMap that collide with
+	// clabernetes-managed mounts (for example, "topo.clab.yaml" which is always mounted by
+	// clabernetes itself). Kubernetes rejects duplicate mountPaths.
+	{
+		seen := map[string]struct{}{}
+		for i := range launcherContainer.VolumeMounts {
+			seen[strings.TrimSpace(launcherContainer.VolumeMounts[i].MountPath)] = struct{}{}
+		}
+		for _, vm := range volumeMountsFromCommonSpec {
+			mp := strings.TrimSpace(vm.MountPath)
+			if mp == "" {
+				continue
+			}
+			if _, ok := seen[mp]; ok {
+				continue
+			}
+			launcherContainer.VolumeMounts = append(launcherContainer.VolumeMounts, vm)
+			seen[mp] = struct{}{}
+		}
+	}
 
-	deployment.Spec.Template.Spec.Containers = []k8scorev1.Container{container}
+	if !nativeMode {
+		deployment.Spec.Template.Spec.Containers = []k8scorev1.Container{launcherContainer}
+
+		return
+	}
+
+	// native mode, so we have the sidecar and the nos container
+	launcherContainer.Name = "clabernetes-launcher"
+
+	nodeImage := clabernetesConfigs[nodeName].Topology.GetNodeImage(nodeName)
+
+	nosContainer := k8scorev1.Container{
+		Name:  nodeName,
+		Image: nodeImage,
+		VolumeMounts: []k8scorev1.VolumeMount{
+			{
+				Name:      "docker",
+				ReadOnly:  false,
+				MountPath: "/clabernetes",
+			},
+		},
+		TerminationMessagePath:   "/dev/termination-log",
+		TerminationMessagePolicy: "File",
+		ImagePullPolicy:          k8scorev1.PullPolicy(imagePullPolicy),
+	}
+
+	// Best-effort support for common containerlab node overrides when running in native mode.
+	// For linux-based nodes, `cmd:` in the topology is commonly used (for example `sleep infinity`).
+	if nodeDef, ok := clabernetesConfigs[nodeName].Topology.Nodes[nodeName]; ok {
+		if strings.EqualFold(nodeDef.Kind, "linux") {
+			cmd := strings.TrimSpace(nodeDef.Cmd)
+			if cmd == "" {
+				lc := strings.ToLower(strings.TrimSpace(nodeImage))
+				// Common netlab examples use python/alpine images for linux hosts. In Kubernetes,
+				// these can exit immediately when STDIN is not attached. Force a long-running
+				// command so the node stays up for exec/config steps.
+				if strings.Contains(lc, "python") || strings.Contains(lc, "alpine") {
+					cmd = "sleep infinity"
+				}
+			}
+			if cmd != "" {
+				nosContainer.Command = []string{"sh", "-c", cmd}
+			}
+		}
+
+		if len(nodeDef.Env) > 0 {
+			for k, v := range nodeDef.Env {
+				nosContainer.Env = append(
+					nosContainer.Env,
+					k8scorev1.EnvVar{Name: k, Value: v},
+				)
+			}
+			slices.SortFunc(nosContainer.Env, func(a, b k8scorev1.EnvVar) int { return strings.Compare(a.Name, b.Name) })
+		}
+
+		// systemd-based NOS images often require writable tmpfs mounts.
+		// In containerlab/Docker mode these are commonly configured by containerlab runtime flags;
+		// in native mode we must provide them as Kubernetes volumes.
+		if strings.EqualFold(nodeDef.Kind, "ceos") || strings.EqualFold(nodeDef.Kind, "eos") {
+			existingMounts := map[string]struct{}{}
+			for _, vm := range nosContainer.VolumeMounts {
+				existingMounts[strings.TrimSpace(vm.MountPath)] = struct{}{}
+			}
+			existingVolumes := map[string]struct{}{}
+			for _, v := range deployment.Spec.Template.Spec.Volumes {
+				existingVolumes[v.Name] = struct{}{}
+			}
+
+			addEmptyDir := func(volName, mountPath string, medium k8scorev1.StorageMedium) {
+				volName = strings.TrimSpace(volName)
+				mountPath = strings.TrimSpace(mountPath)
+				if volName == "" || mountPath == "" {
+					return
+				}
+				if _, ok := existingMounts[mountPath]; ok {
+					return
+				}
+				if _, ok := existingVolumes[volName]; !ok {
+					deployment.Spec.Template.Spec.Volumes = append(
+						deployment.Spec.Template.Spec.Volumes,
+						k8scorev1.Volume{
+							Name: volName,
+							VolumeSource: k8scorev1.VolumeSource{
+								EmptyDir: &k8scorev1.EmptyDirVolumeSource{
+									Medium: medium,
+								},
+							},
+						},
+					)
+					existingVolumes[volName] = struct{}{}
+				}
+				nosContainer.VolumeMounts = append(
+					nosContainer.VolumeMounts,
+					k8scorev1.VolumeMount{
+						Name:      volName,
+						MountPath: mountPath,
+					},
+				)
+				existingMounts[mountPath] = struct{}{}
+			}
+
+			addEmptyDir("systemd-run", "/run", k8scorev1.StorageMediumMemory)
+			addEmptyDir("systemd-runlock", "/run/lock", k8scorev1.StorageMediumMemory)
+			addEmptyDir("systemd-tmp", "/tmp", k8scorev1.StorageMediumMemory)
+
+			// In containerlab, the ceos node driver:
+			// - sets critical env vars (CEOS/EOS_PLATFORM/MAPETH0/MGMT_INTF/INTFTYPE/...)
+			// - injects these via systemd.setenv at /sbin/init start
+			// - places startup-config in /mnt/flash/startup-config
+			//
+			// In clabernetes native mode, we must replicate the minimum required pieces for ceos
+			// to initialize (Sysdb/ConfigAgent) and bring up SSH on the management plane.
+
+			// Ensure startup-config is mounted into the NOS container at the location expected by ceos.
+			//
+			// In clabernetes, startup-config is typically rendered into a ConfigMap that contains one key per
+			// node (like "l1-startup.cfg") and that key is mounted at the filePath that containerlab expects
+			// (nodeDef.StartupConfig). We identify the correct ConfigMap/key by matching FilePath.
+			startupConfigPath := ""
+			if strings.TrimSpace(nodeDef.StartupConfig) != "" {
+				startupConfigPath = strings.TrimSpace(nodeDef.StartupConfig)
+			}
+			if startupConfigPath != "" {
+				for _, f := range owningTopology.Spec.Deployment.FilesFromConfigMap[nodeName] {
+					if strings.TrimSpace(f.ConfigMapName) == "" || strings.TrimSpace(f.ConfigMapPath) == "" {
+						continue
+					}
+					if strings.TrimSpace(f.FilePath) != startupConfigPath {
+						continue
+					}
+
+					volumeName := clabernetesutilkubernetes.EnforceDNSLabelConvention(
+						clabernetesutilkubernetes.SafeConcatNameKubernetes(
+							f.ConfigMapName,
+							f.ConfigMapPath,
+						),
+					)
+
+					if _, ok := existingMounts["/mnt/flash/startup-config"]; ok {
+						break
+					}
+
+					nosContainer.VolumeMounts = append(
+						nosContainer.VolumeMounts,
+						k8scorev1.VolumeMount{
+							Name:      volumeName,
+							ReadOnly:  true,
+							MountPath: "/mnt/flash/startup-config",
+							SubPath:   f.ConfigMapPath,
+						},
+					)
+					existingMounts["/mnt/flash/startup-config"] = struct{}{}
+					break
+				}
+			}
+
+			// Ensure the ceos-required env vars exist and are passed via systemd.setenv.
+			//
+			// NOTE: INTFTYPE must match the actual pod interfaces created for data-plane links.
+			// Netlab commonly uses `etX` endpoint names (l1:et1, l1:et2, ...) which we preserve,
+			// so we must not unconditionally override INTFTYPE here.
+			ceosEnv := map[string]string{
+				"CEOS":                                "1",
+				"EOS_PLATFORM":                        "ceoslab",
+				"container":                           "docker",
+				"ETBA":                                "1",
+				"SKIP_ZEROTOUCH_BARRIER_IN_SYSDBINIT": "1",
+				// containerlab defaults that help cEOS boot reliably
+				"MAPETH0":   "1",
+				"MGMT_INTF": "eth0",
+			}
+
+			existingEnv := map[string]string{}
+			for _, e := range nosContainer.Env {
+				existingEnv[strings.TrimSpace(e.Name)] = e.Value
+			}
+
+			// Preserve INTFTYPE from the node definition when present (e.g. "et" from netlab),
+			// otherwise default to "eth".
+			intfType := strings.TrimSpace(existingEnv["INTFTYPE"])
+			if intfType == "" {
+				intfType = "eth"
+			}
+			ceosEnv["INTFTYPE"] = intfType
+
+			// In Skyforge, we expect management reachability to come from the Kubernetes pod network,
+			// not a separate "management VRF" inside the NOS container. Passing CLAB_MGMT_VRF through
+			// to cEOS can result in the pod network interface being repurposed and losing the pod IP.
+			//
+			// Remove it to preserve Kubernetes/Cilium networking for SSH reachability from the in-cluster collector.
+			delete(existingEnv, "CLAB_MGMT_VRF")
+			nosContainer.Env = slices.DeleteFunc(nosContainer.Env, func(ev k8scorev1.EnvVar) bool {
+				return strings.TrimSpace(ev.Name) == "CLAB_MGMT_VRF"
+			})
+
+			upsertEnv := func(key, value string) {
+				key = strings.TrimSpace(key)
+				if key == "" {
+					return
+				}
+				existingEnv[key] = value
+
+				for i := range nosContainer.Env {
+					if nosContainer.Env[i].Name == key {
+						nosContainer.Env[i].Value = value
+						return
+					}
+				}
+				nosContainer.Env = append(nosContainer.Env, k8scorev1.EnvVar{Name: key, Value: value})
+			}
+
+			// Always enforce these values for ceos.
+			for k, v := range ceosEnv {
+				upsertEnv(k, v)
+			}
+
+			slices.SortFunc(nosContainer.Env, func(a, b k8scorev1.EnvVar) int { return strings.Compare(a.Name, b.Name) })
+
+			// Start /sbin/init with systemd.setenv arguments so ceos init code sees these values early.
+			//
+			// We use bash -c 'exec ...' so PID 1 remains /sbin/init.
+			var setenvKeys []string
+			for k := range ceosEnv {
+				setenvKeys = append(setenvKeys, k)
+			}
+			slices.Sort(setenvKeys)
+			var cmd strings.Builder
+			cmd.WriteString("exec /sbin/init ")
+			for _, k := range setenvKeys {
+				cmd.WriteString("systemd.setenv=")
+				cmd.WriteString(k)
+				cmd.WriteString("=")
+				cmd.WriteString(existingEnv[k])
+				cmd.WriteString(" ")
+			}
+			nosContainer.Command = []string{"bash", "-c", strings.TrimSpace(cmd.String())}
+		}
+
+		// vrnetlab-based Cisco IOL requires containerlab kind-driver setup (NETMAP/iouyap.ini/nvram),
+		// which is normally performed by containerlab during deploy. In clabernetes native mode we
+		// run the NOS container directly, so we must reproduce those runtime artifacts.
+		//
+		// Note: IOL interfaces generated by netlab may not be valid Linux ifnames (e.g. "Ethernet0/1");
+		// clabernetes vxlan connectivity sanitizes those into Linux-safe interface names. We map the
+		// IOL IOUYAP ports to those sanitized ifnames.
+		if strings.EqualFold(nodeDef.Kind, "cisco_iol") {
+			existingMounts := map[string]struct{}{}
+			for _, vm := range nosContainer.VolumeMounts {
+				existingMounts[strings.TrimSpace(vm.MountPath)] = struct{}{}
+			}
+			existingVolumes := map[string]struct{}{}
+			for _, v := range deployment.Spec.Template.Spec.Volumes {
+				existingVolumes[v.Name] = struct{}{}
+			}
+
+			ensureEmptyDir := func(volName string) {
+				volName = strings.TrimSpace(volName)
+				if volName == "" {
+					return
+				}
+				if _, ok := existingVolumes[volName]; ok {
+					return
+				}
+				deployment.Spec.Template.Spec.Volumes = append(
+					deployment.Spec.Template.Spec.Volumes,
+					k8scorev1.Volume{
+						Name: volName,
+						VolumeSource: k8scorev1.VolumeSource{
+							EmptyDir: &k8scorev1.EmptyDirVolumeSource{},
+						},
+					},
+				)
+				existingVolumes[volName] = struct{}{}
+			}
+
+			runtimeVol := "vrnetlab-runtime"
+			ensureEmptyDir(runtimeVol)
+
+			if _, ok := existingMounts["/vrnetlab"]; !ok {
+				nosContainer.VolumeMounts = append(
+					nosContainer.VolumeMounts,
+					k8scorev1.VolumeMount{
+						Name:      runtimeVol,
+						ReadOnly:  false,
+						MountPath: "/vrnetlab",
+					},
+				)
+				existingMounts["/vrnetlab"] = struct{}{}
+			}
+
+			sum := sha1.Sum([]byte(strings.TrimSpace(owningTopology.Name) + ":" + strings.TrimSpace(nodeName))) //nolint:gosec // non-crypto identifier
+			pid := int(binary.BigEndian.Uint16(sum[:2])%1023) + 1
+			nvramName := fmt.Sprintf("nvram_%05d", pid)
+
+			// Mount the netlab-generated initial config snippet so we can incorporate it into the
+			// boot config we provide to the IOL process.
+			if _, ok := existingMounts["/netlab/initial.cfg"]; !ok {
+				for _, f := range owningTopology.Spec.Deployment.FilesFromConfigMap[nodeName] {
+					if strings.TrimSpace(f.ConfigMapName) == "" || strings.TrimSpace(f.ConfigMapPath) == "" {
+						continue
+					}
+					if strings.TrimSpace(f.ConfigMapPath) != "initial" {
+						continue
+					}
+					volumeName := clabernetesutilkubernetes.EnforceDNSLabelConvention(
+						clabernetesutilkubernetes.SafeConcatNameKubernetes(
+							f.ConfigMapName,
+							f.ConfigMapPath,
+						),
+					)
+					nosContainer.VolumeMounts = append(
+						nosContainer.VolumeMounts,
+						k8scorev1.VolumeMount{
+							Name:      volumeName,
+							ReadOnly:  true,
+							MountPath: "/netlab/initial.cfg",
+							SubPath:   f.ConfigMapPath,
+						},
+					)
+					existingMounts["/netlab/initial.cfg"] = struct{}{}
+					break
+				}
+			}
+
+			// Skyforge C9s mounts netlab outputs (node_files, etc) under /tmp/skyforge-c9s/...
+			// Those mounts are always present in the launcher container, but the IOL bootstrap
+			// script that assembles /vrnetlab/config.txt runs in the NOS container. Mount the
+			// same files into the NOS container so it can append cfglets (e.g. "eigrp", "extra").
+			for _, f := range owningTopology.Spec.Deployment.FilesFromConfigMap[nodeName] {
+				if strings.TrimSpace(f.ConfigMapName) == "" || strings.TrimSpace(f.ConfigMapPath) == "" {
+					continue
+				}
+				mountPath := strings.TrimSpace(f.FilePath)
+				if mountPath == "" {
+					continue
+				}
+				if !strings.HasPrefix(mountPath, "/tmp/skyforge-c9s/") {
+					continue
+				}
+				if _, ok := existingMounts[mountPath]; ok {
+					continue
+				}
+				volumeName := clabernetesutilkubernetes.EnforceDNSLabelConvention(
+					clabernetesutilkubernetes.SafeConcatNameKubernetes(
+						f.ConfigMapName,
+						f.ConfigMapPath,
+					),
+				)
+				nosContainer.VolumeMounts = append(
+					nosContainer.VolumeMounts,
+					k8scorev1.VolumeMount{
+						Name:      volumeName,
+						ReadOnly:  true,
+						MountPath: mountPath,
+						SubPath:   f.ConfigMapPath,
+					},
+				)
+				existingMounts[mountPath] = struct{}{}
+			}
+
+			upsertEnv := func(key, value string) {
+				key = strings.TrimSpace(key)
+				if key == "" {
+					return
+				}
+				for i := range nosContainer.Env {
+					if strings.TrimSpace(nosContainer.Env[i].Name) == key {
+						nosContainer.Env[i].Value = value
+						return
+					}
+				}
+				nosContainer.Env = append(nosContainer.Env, k8scorev1.EnvVar{Name: key, Value: value})
+			}
+
+			upsertEnv("IOL_PID", strconv.Itoa(pid))
+			upsertEnv("SKYFORGE_IOL_NVRAM", nvramName)
+
+			// Determine the set of link interface names for this node, based on the containerlab links.
+			// These interfaces are created by the clabernetes launcher vxlan connectivity manager.
+			linkIfacesSet := map[string]struct{}{}
+			var linkIfaces []string
+			if clabernetesConfigs != nil && clabernetesConfigs[nodeName] != nil {
+				for _, l := range clabernetesConfigs[nodeName].Topology.Links {
+					if len(l.Endpoints) != 2 {
+						continue
+					}
+					for _, ep := range l.Endpoints {
+						parts := strings.SplitN(strings.TrimSpace(ep), ":", 2)
+						if len(parts) != 2 {
+							continue
+						}
+						if parts[0] != nodeName {
+							continue
+						}
+						ifName := sanitizeLinuxIfName(parts[1])
+						if ifName == "" {
+							continue
+						}
+						if _, ok := linkIfacesSet[ifName]; ok {
+							continue
+						}
+						linkIfacesSet[ifName] = struct{}{}
+						linkIfaces = append(linkIfaces, ifName)
+					}
+				}
+			}
+			slices.Sort(linkIfaces)
+
+			upsertEnv("SKYFORGE_IOL_LINK_IFACES", strings.Join(linkIfaces, ","))
+
+			// Override the container entrypoint so we can:
+			// - avoid the vrnetlab entrypoint's `grep eth` assumptions (netlab uses names like Ethernet0/1)
+			// - generate the containerlab runtime artifacts expected by the IOL process
+			// - incorporate netlab config snippet while ensuring SSH is enabled
+			//
+			// This is intentionally "best effort" and does not attempt to replicate every containerlab
+			// behavior, only the minimal required pieces to get IOL booted and reachable.
+			nosContainer.Command = []string{"bash", "-lc", strings.TrimSpace(fmt.Sprintf(`
+set -euo pipefail
+echo "[skyforge] vrnetlab iol bootstrap starting (node=%s pid=%d)"
+node="%s"
+
+IFS=',' read -r -a link_ifaces <<< "${SKYFORGE_IOL_LINK_IFACES:-}"
+for ifn in "${link_ifaces[@]}"; do
+  if [ -z "$ifn" ]; then
+    continue
+  fi
+  for i in $(seq 1 90); do
+    if [ -e "/sys/class/net/$ifn" ]; then
+      break
+    fi
+    sleep 1
+  done
+done
+
+mkdir -p /vrnetlab
+touch "/vrnetlab/${SKYFORGE_IOL_NVRAM}"
+
+# NETMAP: map ios ports to linux ifaces configured in iouyap.ini.
+{
+  echo "${IOL_PID}:0/0 513:0/0"
+  idx=1
+  for ifn in "${link_ifaces[@]}"; do
+    if [ -z "$ifn" ]; then
+      continue
+    fi
+    slot=$((idx / 4))
+    port=$((idx %% 4))
+    echo "${IOL_PID}:${slot}/${port} 513:${slot}/${port}"
+    idx=$((idx+1))
+  done
+} > /vrnetlab/NETMAP
+
+# Build /iol/config.txt (IOS boot config) similar to containerlab's iol kind driver.
+#
+# Important: do NOT "steal" the Kubernetes pod IP (eth0) for IOS management.
+# In CNI setups like Cilium where pod IPs are /32 and routed, moving the pod IP
+# into the VM breaks pod routing and makes the pod unreachable from other nodes.
+#
+# Instead, create an internal management veth pair:
+# - host side: vrl-mgmt0 (169.254.100.1/30)
+# - IOS side:  vrl-mgmt1 (attached to IOS Ethernet0/0 via iouyap)
+# The clabernetes launcher will run a TCP proxy on podIP:22 -> 169.254.100.2:22.
+MGMT_HOST_DEV="vrl-mgmt0"
+MGMT_IOS_DEV="vrl-mgmt1"
+MGMT_HOST_IP="169.254.100.1/30"
+MGMT_IOS_IP="169.254.100.2"
+MGMT_IOS_MASK="255.255.255.252"
+
+if ! ip link show "${MGMT_HOST_DEV}" >/dev/null 2>&1; then
+  ip link add "${MGMT_HOST_DEV}" type veth peer name "${MGMT_IOS_DEV}"
+fi
+ip link set "${MGMT_HOST_DEV}" up
+ip link set "${MGMT_IOS_DEV}" up
+ip addr replace "${MGMT_HOST_IP}" dev "${MGMT_HOST_DEV}"
+
+# IOUYAP config mapping bay/unit ports to linux ifaces.
+{
+  echo "[default]"
+  echo "base_port = 49000"
+  echo "netmap = /iol/NETMAP"
+  echo "[513:0/0]"
+  # Management interface:
+  echo "eth_dev = ${MGMT_IOS_DEV}"
+  idx=1
+  for ifn in "${link_ifaces[@]}"; do
+    if [ -z "$ifn" ]; then
+      continue
+    fi
+    slot=$((idx / 4))
+    port=$((idx %% 4))
+    echo "[513:${slot}/${port}]"
+    echo "eth_dev = $ifn"
+    idx=$((idx+1))
+  done
+} > /vrnetlab/iouyap.ini
+
+: > /vrnetlab/config.txt
+cat >> /vrnetlab/config.txt <<CFGEOF
+hostname ${node}
+!
+no aaa new-model
+!
+ip domain name lab
+!
+ip cef
+!
+ipv6 unicast-routing
+!
+no ip domain lookup
+!
+username admin privilege 15 secret admin
+!
+interface Ethernet0/0
+ description clab-mgmt
+ ip address ${MGMT_IOS_IP} ${MGMT_IOS_MASK}
+ no cdp enable
+ no lldp transmit
+ no lldp receive
+ no shutdown
+!
+ip forward-protocol nd
+!
+ip ssh version 2
+crypto key generate rsa modulus 2048
+!
+line vty 0 4
+ login local
+ transport input ssh
+!
+CFGEOF
+
+	if [ -f /netlab/initial.cfg ]; then
+	  # netlab-generated initial.cfg may include its own "line vty" stanza. That can
+	  # unintentionally disable SSH access. Strip it and re-assert SSH on the vty lines below.
+	  #
+	  # It also commonly includes an "interface Ethernet0/0" stanza (management interface for IOL)
+	  # which can override the vrf/ip config we generate above. Strip that too.
+	  # NOTE: we intentionally avoid sed here. BusyBox sed can fail to parse the
+	  # "Ethernet0/0" address range expression, causing the container to crashloop.
+		  awk '
+		    BEGIN { in_vty=0; in_mgmt_if=0 }
+		    $0 == "line vty 0 4" { in_vty=1; next }
+		    $0 == "interface Ethernet0/0" { in_mgmt_if=1; next }
+		    in_vty {
+		      if ($0 == "!") { in_vty=0 }
+		      next
+		    }
+	    in_mgmt_if {
+	      if ($0 == "!") { in_mgmt_if=0 }
+	      next
+	    }
+		    # netlab can emit IOS/IOS-XE SSH settings that bind the SSH server to a
+		    # management VRF or a specific source-interface. In Skyforge we keep the
+		    # vrnetlab mgmt NIC (Ethernet0/0) in the global routing table so the
+		    # in-cluster Forward collector can reach it. Strip those directives to
+		    # avoid accidentally forcing SSH to listen in a non-existent VRF.
+		    $0 ~ /^ip ssh server vrf / { next }
+		    $0 ~ /^ip ssh source-interface / { next }
+	    { print }
+	  ' /netlab/initial.cfg >> /vrnetlab/config.txt
+	  echo "!" >> /vrnetlab/config.txt
+	fi
+
+	# netlab produces additional cfglets/snippets under /tmp/skyforge-c9s/<topology>/node_files/<node>/.
+	# For IOS/IOS-XE (IOL) we want those applied as part of the initial config load, so append them
+	# to the vrnetlab config file (filtering out vty/mgmt interface stanzas the same way as above).
+	for f in /tmp/skyforge-c9s/*/node_files/${node}/*; do
+	  if [ ! -f "$f" ]; then
+	    continue
+	  fi
+	  bn="$(basename "$f")"
+	  if [ "$bn" = "initial" ] || [ "$bn" = "initial.cfg" ]; then
+	    continue
+	  fi
+	  awk '
+	    BEGIN { in_vty=0; in_mgmt_if=0 }
+	    $0 == "line vty 0 4" { in_vty=1; next }
+	    $0 == "interface Ethernet0/0" { in_mgmt_if=1; next }
+	    in_vty {
+	      if ($0 == "!") { in_vty=0 }
+	      next
+	    }
+	    in_mgmt_if {
+	      if ($0 == "!") { in_mgmt_if=0 }
+	      next
+	    }
+	    $0 ~ /^ip ssh server vrf / { next }
+	    $0 ~ /^ip ssh source-interface / { next }
+	    { print }
+	  ' "$f" >> /vrnetlab/config.txt
+	  echo "!" >> /vrnetlab/config.txt
+	done
+
+cat >> /vrnetlab/config.txt <<CFGEOF
+line vty 0 4
+ login local
+ transport input ssh
+!
+CFGEOF
+
+echo "end" >> /vrnetlab/config.txt
+
+# Symlink the runtime artifacts into /iol to match containerlab expectations.
+ln -sf /vrnetlab/NETMAP /iol/NETMAP
+ln -sf /vrnetlab/iouyap.ini /iol/iouyap.ini
+ln -sf /vrnetlab/config.txt /iol/config.txt
+ln -sf "/vrnetlab/${SKYFORGE_IOL_NVRAM}" "/iol/${SKYFORGE_IOL_NVRAM}"
+
+# Start iouyap (background) + IOL.
+/usr/bin/iouyap -f /iol/iouyap.ini 513 -q -d
+
+ports=$(( ${#link_ifaces[@]} + 1 ))
+slots=$(( (ports + 3) / 4 ))
+echo "[skyforge] starting iol.bin (slots=$slots ports=$ports mgmt=${MGMT_IOS_IP}/${MGMT_IOS_MASK})"
+cd /iol
+exec ./iol.bin "$IOL_PID" -e "$slots" -s 0 -c config.txt -n 1024
+`, nodeName, pid, nodeName))}
+		}
+
+		// Best-effort support for bind mounts in native mode.
+		//
+		// In "classic" (non-native) mode, containerlab/Docker handles common node requirements for
+		// network OSes. In native mode, the NOS runs as a Kubernetes container and relies on k8s
+		// volume mounts. We translate *absolute* host bind mounts into HostPath volumes.
+		if len(nodeDef.Binds) > 0 {
+			existingMounts := map[string]struct{}{}
+			for _, vm := range nosContainer.VolumeMounts {
+				existingMounts[strings.TrimSpace(vm.MountPath)] = struct{}{}
+			}
+			existingVolumes := map[string]struct{}{}
+			for _, v := range deployment.Spec.Template.Spec.Volumes {
+				existingVolumes[v.Name] = struct{}{}
+			}
+
+			for idx, bind := range nodeDef.Binds {
+				bind = strings.TrimSpace(bind)
+				if bind == "" {
+					continue
+				}
+				parts := strings.SplitN(bind, ":", 3)
+				if len(parts) < 2 {
+					continue
+				}
+				hostPath := strings.TrimSpace(parts[0])
+				containerPath := strings.TrimSpace(parts[1])
+				if hostPath == "" || containerPath == "" {
+					continue
+				}
+				// Only translate absolute host paths; relative binds are typically "node_files" and are
+				// handled via other clabernetes mechanisms.
+				if !strings.HasPrefix(hostPath, "/") {
+					continue
+				}
+				if _, ok := existingMounts[containerPath]; ok {
+					continue
+				}
+
+				readOnly := false
+				if len(parts) == 3 {
+					opts := strings.TrimSpace(parts[2])
+					if strings.Contains(opts, "ro") {
+						readOnly = true
+					}
+				}
+
+				volName := fmt.Sprintf("bind-%d", idx)
+				for i := 2; ; i++ {
+					if _, ok := existingVolumes[volName]; !ok {
+						break
+					}
+					volName = fmt.Sprintf("bind-%d-%d", idx, i)
+				}
+				existingVolumes[volName] = struct{}{}
+				existingMounts[containerPath] = struct{}{}
+
+				deployment.Spec.Template.Spec.Volumes = append(
+					deployment.Spec.Template.Spec.Volumes,
+					k8scorev1.Volume{
+						Name: volName,
+						VolumeSource: k8scorev1.VolumeSource{
+							HostPath: &k8scorev1.HostPathVolumeSource{
+								Path: hostPath,
+							},
+						},
+					},
+				)
+				nosContainer.VolumeMounts = append(
+					nosContainer.VolumeMounts,
+					k8scorev1.VolumeMount{
+						Name:      volName,
+						MountPath: containerPath,
+						ReadOnly:  readOnly,
+					},
+				)
+			}
+		}
+
+		if strings.TrimSpace(nodeDef.Cmd) != "" {
+			nosContainer.Command = []string{"sh", "-c", nodeDef.Cmd}
+		} else if strings.TrimSpace(nodeDef.Entrypoint) != "" {
+			nosContainer.Command = []string{"sh", "-c", nodeDef.Entrypoint}
+		}
+	}
+
+	deployment.Spec.Template.Spec.Containers = []k8scorev1.Container{nosContainer, launcherContainer}
+}
+
+func (r *DeploymentReconciler) renderDeploymentMultus(
+	deployment *k8sappsv1.Deployment,
+	owningTopology *clabernetesapisv1alpha1.Topology,
+	nodeName string,
+	clabernetesConfigs map[string]*clabernetesutilcontainerlab.Config,
+) {
+	if owningTopology.Spec.Connectivity != clabernetesconstants.ConnectivityMultus {
+		return
+	}
+
+	r.log.Debugf("multus connectivity enabled for topology %s", owningTopology.Name)
+
+	nodeConfig, ok := clabernetesConfigs[nodeName]
+	if !ok {
+		return
+	}
+
+	// Keep NAD naming consistent with NetworkAttachmentDefinitionReconciler.Resolve,
+	// which uses nodeConfig.Name as the link namespace prefix.
+	topologyName := nodeConfig.Name
+
+	var networkNames []string
+
+	for idx := range nodeConfig.Topology.Links {
+		// we use the index from the original links slice as the unique ID for the NAD
+		// this assumes the link order is stable, which it should be since it comes from
+		// the same topology object.
+		nadName := fmt.Sprintf("%s-l%d", topologyName, idx)
+		networkNames = append(networkNames, nadName)
+	}
+
+	if len(networkNames) == 0 {
+		return
+	}
+
+	// annotation format: k8s.v1.cni.cncf.io/networks: '[{"name": "nad1"}, {"name": "nad2"}]'
+	// for simplicity we'll just use the short format if possible, but let's do the json one
+	// to be explicit and future-proof.
+	type multusNet struct {
+		Name      string `json:"name"`
+		Namespace string `json:"namespace,omitempty"`
+	}
+
+	multusNets := make([]multusNet, len(networkNames))
+	for i, name := range networkNames {
+		multusNets[i] = multusNet{Name: name}
+	}
+
+	// If this node runs a vrnetlab-based NOS (IOL/VIOS/NXOSv/etc), add a dedicated
+	// management network attachment.
+	//
+	// Many vrnetlab images assume they can take over eth0 and may flush its IP
+	// addresses. In Kubernetes, eth0 is the pod network, so losing it breaks
+	// pod connectivity. A secondary Multus interface gives the NOS an interface
+	// it can own without affecting the pod network.
+	//
+	// This NetworkAttachmentDefinition is installed by Skyforge Helm as:
+	//   kube-system/vrnetlab-mgmt
+	if node, ok := nodeConfig.Topology.Nodes[nodeName]; ok {
+		switch strings.TrimSpace(node.Kind) {
+		case "cisco_iol", "vios", "viosl2", "vr-n9kv", "asav", "vmx", "sros", "csr":
+			multusNets = append(multusNets, multusNet{Name: "vrnetlab-mgmt", Namespace: "kube-system"})
+		}
+	}
+
+	multusNetsJSON, err := json.Marshal(multusNets)
+	if err != nil {
+		r.log.Criticalf("failed marshaling multus networks to json, error: %s", err)
+
+		return
+	}
+
+	if deployment.Spec.Template.Annotations == nil {
+		deployment.Spec.Template.Annotations = make(map[string]string)
+	}
+
+	deployment.Spec.Template.Annotations["k8s.v1.cni.cncf.io/networks"] = string(multusNetsJSON)
+}
+
+func (r *DeploymentReconciler) renderDeploymentNative(
+	deployment *k8sappsv1.Deployment,
+	nodeName,
+	configVolumeName string,
+	volumeMountsFromCommonSpec []k8scorev1.VolumeMount,
+	owningTopology *clabernetesapisv1alpha1.Topology,
+	clabernetesConfigs map[string]*clabernetesutilcontainerlab.Config,
+) {
+	if !ResolveNativeMode(owningTopology) {
+		return
+	}
+
+	// When ShareProcessNamespace is enabled, the "native" NOS container may not end up as PID 1.
+	// Systemd-based NOS images (like Arista cEOS) require being PID 1 and will crash otherwise.
+	//
+	// Disable process namespace sharing for these nodes while still allowing native mode.
+	if clabernetesConfigs != nil && clabernetesConfigs[nodeName] != nil {
+		if node, ok := clabernetesConfigs[nodeName].Topology.Nodes[nodeName]; ok {
+			switch node.Kind {
+			case "ceos", "eos":
+				deployment.Spec.Template.Spec.ShareProcessNamespace = nil
+			}
+		}
+	}
+
+	launcherContainer := r.getLauncherContainer(deployment)
+
+	initContainer := launcherContainer.DeepCopy()
+	initContainer.Name = "clabernetes-setup"
+	initContainer.Command = []string{"/clabernetes/manager", "setup"}
+
+	deployment.Spec.Template.Spec.InitContainers = append(
+		deployment.Spec.Template.Spec.InitContainers,
+		*initContainer,
+	)
+}
+
+func (r *DeploymentReconciler) getLauncherContainer(
+	deployment *k8sappsv1.Deployment,
+) *k8scorev1.Container {
+	for i := range deployment.Spec.Template.Spec.Containers {
+		if deployment.Spec.Template.Spec.Containers[i].Name == "clabernetes-launcher" {
+			return &deployment.Spec.Template.Spec.Containers[i]
+		}
+	}
+
+	return &deployment.Spec.Template.Spec.Containers[0]
 }
 
 func (r *DeploymentReconciler) renderDeploymentContainerEnv( //nolint: funlen
@@ -841,6 +1790,16 @@ func (r *DeploymentReconciler) renderDeploymentContainerEnv( //nolint: funlen
 		},
 	}
 
+	if ResolveNativeMode(owningTopology) {
+		envs = append(
+			envs,
+			k8scorev1.EnvVar{
+				Name:  clabernetesconstants.LauncherNativeModeEnv,
+				Value: clabernetesconstants.True,
+			},
+		)
+	}
+
 	if ResolveGlobalVsTopologyBool(
 		r.configManagerGetter().GetContainerlabDebug(),
 		owningTopology.Spec.Deployment.ContainerlabDebug,
@@ -901,7 +1860,12 @@ func (r *DeploymentReconciler) renderDeploymentContainerEnv( //nolint: funlen
 		)
 	}
 
-	deployment.Spec.Template.Spec.Containers[0].Env = envs
+	r.getLauncherContainer(deployment).Env = envs
+	for i := range deployment.Spec.Template.Spec.InitContainers {
+		if deployment.Spec.Template.Spec.InitContainers[i].Name == "clabernetes-setup" {
+			deployment.Spec.Template.Spec.InitContainers[i].Env = envs
+		}
+	}
 }
 
 func (r *DeploymentReconciler) renderDeploymentContainerResources(
@@ -912,14 +1876,14 @@ func (r *DeploymentReconciler) renderDeploymentContainerResources(
 ) {
 	nodeResources, nodeResourcesOk := owningTopology.Spec.Deployment.Resources[nodeName]
 	if nodeResourcesOk {
-		deployment.Spec.Template.Spec.Containers[0].Resources = nodeResources
+		r.getLauncherContainer(deployment).Resources = nodeResources
 
 		return
 	}
 
 	defaultResources, defaultResourcesOk := owningTopology.Spec.Deployment.Resources[clabernetesconstants.Default] //nolint:lll
 	if defaultResourcesOk {
-		deployment.Spec.Template.Spec.Containers[0].Resources = defaultResources
+		r.getLauncherContainer(deployment).Resources = defaultResources
 
 		return
 	}
@@ -929,7 +1893,7 @@ func (r *DeploymentReconciler) renderDeploymentContainerResources(
 	)
 
 	if resources != nil {
-		deployment.Spec.Template.Spec.Containers[0].Resources = *resources
+		r.getLauncherContainer(deployment).Resources = *resources
 	}
 }
 
@@ -958,9 +1922,11 @@ func (r *DeploymentReconciler) renderDeploymentContainerPrivileges(
 		r.configManagerGetter().GetPrivilegedLauncher(),
 		owningTopology.Spec.Deployment.PrivilegedLauncher,
 	) {
-		deployment.Spec.Template.Spec.Containers[0].SecurityContext = &k8scorev1.SecurityContext{
-			Privileged: clabernetesutil.ToPointer(true),
-			RunAsUser:  clabernetesutil.ToPointer(int64(0)),
+		for i := range deployment.Spec.Template.Spec.Containers {
+			deployment.Spec.Template.Spec.Containers[i].SecurityContext = &k8scorev1.SecurityContext{
+				Privileged: clabernetesutil.ToPointer(true),
+				RunAsUser:  clabernetesutil.ToPointer(int64(0)),
+			}
 		}
 
 		return
@@ -973,64 +1939,57 @@ func (r *DeploymentReconciler) renderDeploymentContainerPrivileges(
 		"%s/%s", "container.apparmor.security.beta.kubernetes.io", nodeName,
 	)] = "unconfined"
 
-	deployment.Spec.Template.Spec.Containers[0].SecurityContext = &k8scorev1.SecurityContext{
-		Privileged: clabernetesutil.ToPointer(false),
-		RunAsUser:  clabernetesutil.ToPointer(int64(0)),
-		Capabilities: &k8scorev1.Capabilities{
-			Add: []k8scorev1.Capability{
-				// docker says we need these ones:
-				// https://github.com/moby/moby/blob/master/oci/caps/defaults.go#L6-L19
-				"CHOWN",
-				"DAC_OVERRIDE",
-				"FSETID",
-				"FOWNER",
-				"MKNOD",
-				"NET_RAW",
-				"SETGID",
-				"SETUID",
-				"SETFCAP",
-				"SETPCAP",
-				"NET_BIND_SERVICE",
-				"SYS_CHROOT",
-				"KILL",
-				"AUDIT_WRITE",
-				// docker doesnt say we need this but surely we do otherwise cant connect to
-				// daemon
-				"NET_ADMIN",
-				// cant untar/load image w/out this it seems
-				// https://github.com/moby/moby/issues/43086
-				"SYS_ADMIN",
-				// this it seems we need otherwise we get some issues finding child pid of
-				// containers and when we "docker run" it craps out
-				"SYS_RESOURCE",
-				// and some more that we needed to boot srl
-				"LINUX_IMMUTABLE",
-				"SYS_BOOT",
-				"SYS_TIME",
-				"SYS_MODULE",
-				"SYS_RAWIO",
-				"SYS_PTRACE",
-				// and some more that we need to run xdp lc manager in srl, and probably others!?
-				"SYS_NICE",
-				"IPC_LOCK",
-				// the rest for convenience of adding more later if needed
-				// "MAC_OVERRIDE",
-				// "MAC_ADMIN",
-				// "BPF",
-				// "PERFMON",
-				// "NET_BROADCAST",
-				// "DAC_READ_SEARCH",
-				// "SYSLOG",
-				// "WAKE_ALARM",
-				// "BLOCK_SUSPEND",
-				// "AUDIT_READ",
-				// "LEASE",
-				// "CHECKPOINT_RESTORE",
-				// "SYS_TTY_CONFIG",
-				// "SYS_PACCT",
-				// "IPC_OWNER",
+	// if native mode is enabled, we also need to set the sidecar as unconfined
+	if ResolveNativeMode(owningTopology) {
+		deployment.ObjectMeta.Annotations[fmt.Sprintf(
+			"%s/%s", "container.apparmor.security.beta.kubernetes.io", "clabernetes-launcher",
+		)] = "unconfined"
+	}
+
+	for i := range deployment.Spec.Template.Spec.Containers {
+		deployment.Spec.Template.Spec.Containers[i].SecurityContext = &k8scorev1.SecurityContext{
+			Privileged: clabernetesutil.ToPointer(false),
+			RunAsUser:  clabernetesutil.ToPointer(int64(0)),
+			Capabilities: &k8scorev1.Capabilities{
+				Add: []k8scorev1.Capability{
+					// docker says we need these ones:
+					// https://github.com/moby/moby/blob/master/oci/caps/defaults.go#L6-L19
+					"CHOWN",
+					"DAC_OVERRIDE",
+					"FSETID",
+					"FOWNER",
+					"MKNOD",
+					"NET_RAW",
+					"SETGID",
+					"SETUID",
+					"SETFCAP",
+					"SETPCAP",
+					"NET_BIND_SERVICE",
+					"SYS_CHROOT",
+					"KILL",
+					"AUDIT_WRITE",
+					// docker doesnt say we need this but surely we do otherwise cant connect to
+					// daemon
+					"NET_ADMIN",
+					// cant untar/load image w/out this it seems
+					// https://github.com/moby/moby/issues/43086
+					"SYS_ADMIN",
+					// this it seems we need otherwise we get some issues finding child pid of
+					// containers and when we "docker run" it craps out
+					"SYS_RESOURCE",
+					// and some more that we needed to boot srl
+					"LINUX_IMMUTABLE",
+					"SYS_BOOT",
+					"SYS_TIME",
+					"SYS_MODULE",
+					"SYS_RAWIO",
+					"SYS_PTRACE",
+					// and some more that we need to run xdp lc manager in srl, and probably others!?
+					"SYS_NICE",
+					"IPC_LOCK",
+				},
 			},
-		},
+		}
 	}
 }
 
@@ -1070,7 +2029,7 @@ func (r *DeploymentReconciler) renderDeploymentContainerStatus(
 
 	// startup probe delays the start of the readiness probe -- this gives us time for the nos to
 	// boot before we start doing the readiness check on the (slightly) faster frequency
-	deployment.Spec.Template.Spec.Containers[0].StartupProbe = &k8scorev1.Probe{
+	r.getLauncherContainer(deployment).StartupProbe = &k8scorev1.Probe{
 		ProbeHandler: k8scorev1.ProbeHandler{
 			Exec: &k8scorev1.ExecAction{
 				Command: []string{
@@ -1089,7 +2048,7 @@ func (r *DeploymentReconciler) renderDeploymentContainerStatus(
 
 	// after the startup probe has done its thing we set run the readiness probe -- since the
 	// launcher doenst check the status super frequently we keep this pretty slow too
-	deployment.Spec.Template.Spec.Containers[0].ReadinessProbe = &k8scorev1.Probe{
+	r.getLauncherContainer(deployment).ReadinessProbe = &k8scorev1.Probe{
 		ProbeHandler: k8scorev1.ProbeHandler{
 			Exec: &k8scorev1.ExecAction{
 				Command: []string{
@@ -1141,8 +2100,8 @@ func (r *DeploymentReconciler) renderDeploymentContainerStatus(
 		}
 	}
 
-	deployment.Spec.Template.Spec.Containers[0].Env = append(
-		deployment.Spec.Template.Spec.Containers[0].Env,
+	r.getLauncherContainer(deployment).Env = append(
+		r.getLauncherContainer(deployment).Env,
 		probeEnvVars...,
 	)
 }
@@ -1151,69 +2110,59 @@ func (r *DeploymentReconciler) renderDeploymentDevices(
 	deployment *k8sappsv1.Deployment,
 	owningTopology *clabernetesapisv1alpha1.Topology,
 ) {
-	if ResolveGlobalVsTopologyBool(
-		r.configManagerGetter().GetPrivilegedLauncher(),
-		owningTopology.Spec.Deployment.PrivilegedLauncher,
-	) {
-		// launcher is privileged, no need to mount devices explicitly
-		return
+	// Even in privileged mode, device nodes like /dev/kvm are not guaranteed to
+	// exist in the container filesystem unless explicitly mounted. KVM-backed NOS
+	// images (IOL/VIOS/vrnetlab/etc.) require /dev/kvm, and network OSes often need
+	// /dev/net/tun. Provide these device mounts consistently for all containers.
+
+	ensureVolume := func(name, hostPath string) {
+		for _, v := range deployment.Spec.Template.Spec.Volumes {
+			if v.Name == name {
+				return
+			}
+		}
+		deployment.Spec.Template.Spec.Volumes = append(
+			deployment.Spec.Template.Spec.Volumes,
+			k8scorev1.Volume{
+				Name: name,
+				VolumeSource: k8scorev1.VolumeSource{
+					HostPath: &k8scorev1.HostPathVolumeSource{
+						Path: hostPath,
+						Type: clabernetesutil.ToPointer(k8scorev1.HostPathType("")),
+					},
+				},
+			},
+		)
 	}
 
-	// add volumes for devices we care about
-	deployment.Spec.Template.Spec.Volumes = append(
-		deployment.Spec.Template.Spec.Volumes,
-		[]k8scorev1.Volume{
-			{
-				Name: "dev-kvm",
-				VolumeSource: k8scorev1.VolumeSource{
-					HostPath: &k8scorev1.HostPathVolumeSource{
-						Path: "/dev/kvm",
-						Type: clabernetesutil.ToPointer(k8scorev1.HostPathType("")),
-					},
-				},
-			},
-			{
-				Name: "dev-fuse",
-				VolumeSource: k8scorev1.VolumeSource{
-					HostPath: &k8scorev1.HostPathVolumeSource{
-						Path: "/dev/fuse",
-						Type: clabernetesutil.ToPointer(k8scorev1.HostPathType("")),
-					},
-				},
-			},
-			{
-				Name: "dev-net-tun",
-				VolumeSource: k8scorev1.VolumeSource{
-					HostPath: &k8scorev1.HostPathVolumeSource{
-						Path: "/dev/net/tun",
-						Type: clabernetesutil.ToPointer(k8scorev1.HostPathType("")),
-					},
-				},
-			},
-		}...,
-	)
+	ensureVolume("dev-kvm", "/dev/kvm")
+	ensureVolume("dev-fuse", "/dev/fuse")
+	ensureVolume("dev-net-tun", "/dev/net/tun")
 
-	// then mount them in our container (launchers (for now?!) only ever have the one container)
-	deployment.Spec.Template.Spec.Containers[0].VolumeMounts = append(
-		deployment.Spec.Template.Spec.Containers[0].VolumeMounts,
-		[]k8scorev1.VolumeMount{
-			{
-				Name:      "dev-kvm",
-				ReadOnly:  true,
-				MountPath: "/dev/kvm",
+	ensureMount := func(c *k8scorev1.Container, name, mountPath string) {
+		if c == nil {
+			return
+		}
+		for _, vm := range c.VolumeMounts {
+			if vm.Name == name || strings.TrimSpace(vm.MountPath) == mountPath {
+				return
+			}
+		}
+		c.VolumeMounts = append(
+			c.VolumeMounts,
+			k8scorev1.VolumeMount{
+				Name:      name,
+				ReadOnly:  false,
+				MountPath: mountPath,
 			},
-			{
-				Name:      "dev-fuse",
-				ReadOnly:  true,
-				MountPath: "/dev/fuse",
-			},
-			{
-				Name:      "dev-net-tun",
-				ReadOnly:  true,
-				MountPath: "/dev/net/tun",
-			},
-		}...,
-	)
+		)
+	}
+
+	for i := range deployment.Spec.Template.Spec.Containers {
+		ensureMount(&deployment.Spec.Template.Spec.Containers[i], "dev-kvm", "/dev/kvm")
+		ensureMount(&deployment.Spec.Template.Spec.Containers[i], "dev-fuse", "/dev/fuse")
+		ensureMount(&deployment.Spec.Template.Spec.Containers[i], "dev-net-tun", "/dev/net/tun")
+	}
 }
 
 func (r *DeploymentReconciler) renderDeploymentPersistence(
@@ -1241,8 +2190,8 @@ func (r *DeploymentReconciler) renderDeploymentPersistence(
 		},
 	)
 
-	deployment.Spec.Template.Spec.Containers[0].VolumeMounts = append(
-		deployment.Spec.Template.Spec.Containers[0].VolumeMounts,
+	r.getLauncherContainer(deployment).VolumeMounts = append(
+		r.getLauncherContainer(deployment).VolumeMounts,
 		k8scorev1.VolumeMount{
 			Name:      volumeName,
 			ReadOnly:  false,
@@ -1257,6 +2206,15 @@ func determineNodeNeedsRestart(
 ) {
 	previousConfig := reconcileData.PreviousConfigs[nodeName]
 	currentConfig := reconcileData.ResolvedConfigs[nodeName]
+
+	// We store the "previous" configs in Topology status as YAML strings and
+	// unmarshal them on each reconcile. Depending on which keys were present in
+	// the YAML, slices/maps can legitimately round-trip as nil vs empty.
+	//
+	// Treat nil/empty collections as equivalent so we don't get stuck in a
+	// perpetual restart loop.
+	normalizeNilCollections(previousConfig)
+	normalizeNilCollections(currentConfig)
 
 	if previousConfig.Debug != currentConfig.Debug {
 		reconcileData.NodesNeedingReboot.Add(nodeName)
@@ -1323,5 +2281,62 @@ func determineNodeNeedsRestart(
 		reconcileData.NodesNeedingReboot.Add(nodeName)
 
 		return
+	}
+}
+
+func normalizeNilCollections(obj any) {
+	if obj == nil {
+		return
+	}
+
+	val := reflect.ValueOf(obj)
+	if val.Kind() != reflect.Pointer || val.IsNil() {
+		return
+	}
+
+	normalizeNilCollectionsValue(val.Elem())
+}
+
+func normalizeNilCollectionsValue(val reflect.Value) {
+	if !val.IsValid() {
+		return
+	}
+
+	switch val.Kind() {
+	case reflect.Pointer:
+		if val.IsNil() {
+			return
+		}
+		normalizeNilCollectionsValue(val.Elem())
+	case reflect.Interface:
+		if val.IsNil() {
+			return
+		}
+		normalizeNilCollectionsValue(val.Elem())
+	case reflect.Struct:
+		for i := 0; i < val.NumField(); i++ {
+			field := val.Field(i)
+
+			switch field.Kind() {
+			case reflect.Slice:
+				if field.IsNil() && field.CanSet() {
+					field.Set(reflect.MakeSlice(field.Type(), 0, 0))
+				}
+			case reflect.Map:
+				if field.IsNil() && field.CanSet() {
+					field.Set(reflect.MakeMap(field.Type()))
+				}
+			default:
+				normalizeNilCollectionsValue(field)
+			}
+		}
+	case reflect.Slice:
+		for i := 0; i < val.Len(); i++ {
+			normalizeNilCollectionsValue(val.Index(i))
+		}
+	case reflect.Map:
+		for _, key := range val.MapKeys() {
+			normalizeNilCollectionsValue(val.MapIndex(key))
+		}
 	}
 }

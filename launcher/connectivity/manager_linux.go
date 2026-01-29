@@ -40,6 +40,10 @@ func NewManager(
 		return &slurpeethManager{
 			common: c,
 		}, nil
+	case clabernetesconstants.ConnectivityMultus:
+		// With Multus connectivity there is no in-pod tunnel process to run; Multus handles link
+		// wiring via NADs at pod creation time.
+		return &noopManager{}, nil
 	default:
 		return nil, fmt.Errorf(
 			"%w: unknown connectivity kind, cannot create connectivity manager",
@@ -47,3 +51,7 @@ func NewManager(
 		)
 	}
 }
+
+type noopManager struct{}
+
+func (m *noopManager) Run() {}

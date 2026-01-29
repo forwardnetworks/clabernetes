@@ -1,0 +1,60 @@
+---
+name: upstream-sync
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Weekly (Monday 06:00 UTC)
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: fetch upstream
+        env:
+          UPSTREAM_URL: "https://github.com/srl-labs/clabernetes.git"
+          UPSTREAM_BRANCH: "main"
+          BASE_BRANCH: "main"
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || true
+          git remote set-url upstream "$UPSTREAM_URL"
+          git fetch upstream "$UPSTREAM_BRANCH" --prune
+          git checkout "$BASE_BRANCH"
+          git pull --ff-only origin "$BASE_BRANCH" || true
+          git checkout -b "chore/upstream-sync-${GITHUB_RUN_ID}"
+          git merge --no-ff --no-commit "upstream/$UPSTREAM_BRANCH" || (git merge --abort && exit 1)
+
+      - name: create PR
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: "chore/upstream-sync-${{ github.run_id }}"
+          base: "main"
+          title: "chore: sync upstream"
+          body: |
+            Automated upstream sync from `srl-labs/clabernetes`.
+
+            - Upstream: https://github.com/srl-labs/clabernetes
+            - Trigger: `${{ github.event_name }}`
+          commit-message: "chore: sync upstream"
+          labels: |
+            upstream-sync

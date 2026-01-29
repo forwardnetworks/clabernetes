@@ -31,6 +31,9 @@ const (
 	// ConnectivitySlurpeeth is a constant for the slurpeeth connectivity flavor.
 	ConnectivitySlurpeeth = "slurpeeth"
 
+	// ConnectivityMultus is a constant for the multus connectivity flavor.
+	ConnectivityMultus = "multus"
+
 	// NodeStatusFile is the file we write the node status to for launchers -- this is also used
 	// by the deployment for startup/liveness probes.
 	NodeStatusFile = "/clabernetes/.nodestatus"

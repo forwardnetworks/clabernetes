@@ -22,8 +22,13 @@ const (
 	// AppNameDefault is the default name for the "app" (the helm value appName) -- "clabernetes".
 	AppNameDefault = "clabernetes"
 
-	// VXLANServicePort is the port number for vxlan that we use in the kubernetes service.
-	VXLANServicePort = 14789
+	// VXLANServicePort is the UDP destination port used for per-link VXLAN tunnels.
+	//
+	// NOTE: We intentionally use 6784, as Arista cEOS installs a restrictive default
+	// iptables policy and explicitly allows a small set of UDP ports including
+	// 4784/6784/7784. Using one of these avoids needing any NOS-specific firewall
+	// changes to support VXLAN-based link emulation.
+	VXLANServicePort = 6784
 
 	// SlurpeethServicePort is the port number for slurpeeth that we use in the kubernetes service.
 	SlurpeethServicePort = 4799

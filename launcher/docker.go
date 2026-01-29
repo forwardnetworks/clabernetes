@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"text/template"
 	"time"
@@ -28,19 +29,19 @@ func daemonConfigExists() bool {
 	return err == nil
 }
 
-func handleInsecureRegistries() error {
+func handleDockerDaemonConfig() error {
 	insecureRegistries := os.Getenv(clabernetesconstants.LauncherInsecureRegistries)
 
-	if insecureRegistries == "" {
-		return nil
-	}
+	var quotedRegistries []string
 
-	splitRegistries := strings.Split(insecureRegistries, ",")
+	if insecureRegistries != "" {
+		splitRegistries := strings.Split(insecureRegistries, ",")
 
-	quotedRegistries := make([]string, len(splitRegistries))
+		quotedRegistries = make([]string, len(splitRegistries))
 
-	for idx, elem := range splitRegistries {
-		quotedRegistries[idx] = fmt.Sprintf("%q", elem)
+		for idx, elem := range splitRegistries {
+			quotedRegistries[idx] = fmt.Sprintf("%q", elem)
+		}
 	}
 
 	templateVars := struct {
@@ -55,7 +56,7 @@ func handleInsecureRegistries() error {
 	// be much more efficient size-wise if not also perofrmance-wise; this *does* assume
 	// the hosts kernel supports overlayfs but that *should* be true almost everywhere at
 	// this point in time... i hope :P
-	if !strings.EqualFold(
+	if strings.EqualFold(
 		os.Getenv(clabernetesconstants.LauncherPrivilegedEnv),
 		clabernetesconstants.True,
 	) {
@@ -71,6 +72,10 @@ func handleInsecureRegistries() error {
 
 	err = t.Execute(&rendered, templateVars)
 	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(dockerDaemonConfig), 0o755); err != nil {
 		return err
 	}
 
@@ -108,6 +113,7 @@ func enableLegacyIPTables(ctx context.Context, logger io.Writer) error {
 
 func startDocker(ctx context.Context, logger io.Writer) error {
 	var attempts int
+	var dockerdStarted bool
 
 	for {
 		psCmd := exec.CommandContext(ctx, "docker", "ps")
@@ -132,13 +138,39 @@ func startDocker(ctx context.Context, logger io.Writer) error {
 
 		err = startCmd.Run()
 		if err != nil {
-			return err
+			// In minimal container images there may be no init scripts; start dockerd directly.
+			// We attempt this once and then fall back to retrying `docker ps`.
+			if !dockerdStarted {
+				dockerdStarted = true
+				if derr := startDockerDaemon(logger); derr != nil {
+					return err
+				}
+			} else {
+				return err
+			}
 		}
 
 		time.Sleep(time.Second)
 
 		attempts++
 	}
+}
+
+func startDockerDaemon(logger io.Writer) error {
+	if _, err := exec.LookPath("dockerd"); err != nil {
+		return err
+	}
+
+	// Start dockerd in the background. The launcher process stays alive for the pod lifetime, so
+	// we keep dockerd as a child and reap it if it exits.
+	cmd := exec.Command("dockerd", "--host=unix:///var/run/docker.sock") //nolint:gosec
+	cmd.Stdout = logger
+	cmd.Stderr = logger
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	go func() { _ = cmd.Wait() }()
+	return nil
 }
 
 func getContainerIDs(ctx context.Context, all bool) ([]string, error) {

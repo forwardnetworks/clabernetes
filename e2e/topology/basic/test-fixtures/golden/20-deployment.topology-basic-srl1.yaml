@@ -83,7 +83,7 @@ spec:
           imagePullPolicy: IfNotPresent
           name: srl1
           ports:
-            - containerPort: 14789
+          - containerPort: 6784
               name: vxlan
               protocol: UDP
             - containerPort: 4799
