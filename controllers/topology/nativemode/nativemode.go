@@ -60,6 +60,8 @@ func ApplyNativeModeOverrides(log claberneteslogging.Instance, in *ApplyInput) {
 		applyCEOS(log, in)
 	case "cisco_iol":
 		applyCiscoIOL(log, in)
+	case "vr-vmx":
+		applyJuniperVMX(in)
 	default:
 		// other kinds are handled elsewhere or require no special native-mode changes
 	}

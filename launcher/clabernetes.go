@@ -65,7 +65,10 @@ func StartClabernetes() {
 			clabernetesconstants.AppNameEnv,
 			clabernetesconstants.AppNameDefault,
 		),
-		nodeName:             os.Getenv(clabernetesconstants.LauncherNodeNameEnv),
+		nodeName: os.Getenv(clabernetesconstants.LauncherNodeNameEnv),
+		nodeKind: strings.TrimSpace(
+			os.Getenv(clabernetesconstants.LauncherNodeKindEnv),
+		),
 		logger:               clabernetesLogger,
 		containerlabLogger:   containerlabLogger,
 		nodeLogger:           nodeLogger,
@@ -86,6 +89,7 @@ type clabernetes struct {
 
 	appName  string
 	nodeName string
+	nodeKind string
 
 	logger             claberneteslogging.Instance
 	containerlabLogger claberneteslogging.Instance
@@ -118,6 +122,8 @@ func (c *clabernetes) startup() {
 		go c.watchContainers()
 	} else {
 		c.logger.Info("native mode enabled, skipping docker image loading and containerlab deploy")
+
+		c.ensureNativeDeviceRequirements()
 
 		err := c.ensurePodNetFromSnapshot(c.ctx)
 		if err != nil {

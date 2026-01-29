@@ -810,7 +810,7 @@ func (r *DeploymentReconciler) renderDeploymentContainer(
 	deployment.Spec.Template.Spec.ShareProcessNamespace = clabernetesutil.ToPointer(true)
 }
 
-func (r *DeploymentReconciler) renderDeploymentContainerEnv( //nolint:funlen,gocyclo
+func (r *DeploymentReconciler) renderDeploymentContainerEnv( //nolint:funlen,gocyclo,maintidx
 	deployment *k8sappsv1.Deployment,
 	nodeName,
 	owningTopologyName string,
@@ -844,6 +844,14 @@ func (r *DeploymentReconciler) renderDeploymentContainerEnv( //nolint:funlen,goc
 			r.log.Warnf("failed marshaling topology, error: %s", err)
 		} else {
 			r.log.Debugf("node topology:\n%s", string(subTopologyBytes))
+		}
+	}
+
+	nodeKind := ""
+
+	if clabernetesConfigs[nodeName] != nil && clabernetesConfigs[nodeName].Topology != nil {
+		if nd := clabernetesConfigs[nodeName].Topology.Nodes[nodeName]; nd != nil {
+			nodeKind = strings.TrimSpace(nd.Kind)
 		}
 	}
 
@@ -916,6 +924,10 @@ func (r *DeploymentReconciler) renderDeploymentContainerEnv( //nolint:funlen,goc
 		{
 			Name:  clabernetesconstants.LauncherNodeImageEnv,
 			Value: nodeImage,
+		},
+		{
+			Name:  clabernetesconstants.LauncherNodeKindEnv,
+			Value: nodeKind,
 		},
 		{
 			Name:  clabernetesconstants.LauncherConnectivityKind,
