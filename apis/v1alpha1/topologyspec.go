@@ -147,6 +147,15 @@ type Deployment struct {
 	// to "scheduling" things (affinity/node selector/tolerations).
 	// +optional
 	Scheduling Scheduling `json:"scheduling"`
+	// NativeMode, when true, tells clabernetes to attempt to run the node image directly as a
+	// Kubernetes container (sidecar mode) instead of inside the containerlab-managed nested docker
+	// runtime.
+	//
+	// Native mode is useful for performance and for environments where nested container runtimes
+	// are undesirable. It is also more sensitive to node image behavior (some images assume they
+	// can freely manipulate the shared pod network namespace).
+	// +optional
+	NativeMode *bool `json:"nativeMode,omitempty"`
 	// PrivilegedLauncher, when true, sets the launcher containers to privileged. Historically we
 	// tried very hard to *not* need to set privileged mode on pods, however the reality is it is
 	// much, much easier to get various network operating system images booting with this enabled,

@@ -112,6 +112,14 @@ const (
 	// LauncherSSHProbePassword is the env var that holds the password to use in the ssh probe (if
 	// configured).
 	LauncherSSHProbePassword = "LAUNCHER_SSH_PROBE_PASSWORD" //nolint:gosec
+
+	// LauncherNativeModeEnv indicates the launcher should operate in native mode (sidecar mode).
+	LauncherNativeModeEnv = "LAUNCHER_NATIVE_MODE"
+
+	// LauncherRuntimeDirEnv is the base directory for launcher runtime state that must be shared
+	// between init containers and the launcher container (for example cached tunnels or pod net
+	// snapshots).
+	LauncherRuntimeDirEnv = "LAUNCHER_RUNTIME_DIR"
 )
 
 const (
