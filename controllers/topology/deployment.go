@@ -13,6 +13,7 @@ import (
 	clabernetesapisv1alpha1 "github.com/srl-labs/clabernetes/apis/v1alpha1"
 	clabernetesconfig "github.com/srl-labs/clabernetes/config"
 	clabernetesconstants "github.com/srl-labs/clabernetes/constants"
+	clabernetescontrollerstopologynativemode "github.com/srl-labs/clabernetes/controllers/topology/nativemode"
 	claberneteserrors "github.com/srl-labs/clabernetes/errors"
 	claberneteslogging "github.com/srl-labs/clabernetes/logging"
 	clabernetesutil "github.com/srl-labs/clabernetes/util"
@@ -29,6 +30,11 @@ const (
 	probePeriodSeconds                  = 20
 	probeReadinessFailureThreshold      = 3
 	probeDefaultStartupFailureThreshold = 40
+
+	launcherContainerName   = "clabernetes-launcher"
+	setupInitContainerName  = "clabernetes-setup"
+	nativeRuntimeVolumeName = "clabernetes-runtime"
+	nativeRuntimeMountPath  = "/clabernetes/runtime"
 )
 
 // DeploymentReconciler is a subcomponent of the "TopologyReconciler" but is exposed for testing
@@ -151,6 +157,7 @@ func (r *DeploymentReconciler) Render(
 		configVolumeName,
 		volumeMountsFromCommonSpec,
 		owningTopology,
+		clabernetesConfigs,
 	)
 
 	r.renderDeploymentContainerEnv(
@@ -418,6 +425,8 @@ func (r *DeploymentReconciler) renderDeploymentVolumes( //nolint:funlen
 	owningTopologyName string,
 	owningTopology *clabernetesapisv1alpha1.Topology,
 ) []k8scorev1.VolumeMount {
+	nativeMode := ResolveNativeMode(owningTopology)
+
 	volumes := []k8scorev1.Volume{
 		{
 			Name: configVolumeName,
@@ -432,17 +441,36 @@ func (r *DeploymentReconciler) renderDeploymentVolumes( //nolint:funlen
 				},
 			},
 		},
-		{
-			Name: "docker",
-			VolumeSource: k8scorev1.VolumeSource{
-				EmptyDir: &k8scorev1.EmptyDirVolumeSource{},
+	}
+
+	if nativeMode {
+		volumes = append(
+			volumes,
+			k8scorev1.Volume{
+				Name: nativeRuntimeVolumeName,
+				VolumeSource: k8scorev1.VolumeSource{
+					EmptyDir: &k8scorev1.EmptyDirVolumeSource{},
+				},
 			},
-		},
+		)
+	} else {
+		volumes = append(
+			volumes,
+			k8scorev1.Volume{
+				Name: "docker",
+				VolumeSource: k8scorev1.VolumeSource{
+					EmptyDir: &k8scorev1.EmptyDirVolumeSource{},
+				},
+			},
+		)
 	}
 
 	volumeMountsFromCommonSpec := make([]k8scorev1.VolumeMount, 0)
 
-	criPath, criSubPath := r.renderDeploymentVolumesGetCRISockPath(owningTopology)
+	criPath, criSubPath := "", ""
+	if !nativeMode {
+		criPath, criSubPath = r.renderDeploymentVolumesGetCRISockPath(owningTopology)
+	}
 
 	if criPath != "" && criSubPath != "" {
 		volumes = append(
@@ -478,7 +506,7 @@ func (r *DeploymentReconciler) renderDeploymentVolumes( //nolint:funlen
 		dockerDaemonConfigSecret = r.configManagerGetter().GetDockerDaemonConfig()
 	}
 
-	if dockerDaemonConfigSecret != "" {
+	if dockerDaemonConfigSecret != "" && !nativeMode {
 		volumes = append(
 			volumes,
 			k8scorev1.Volume{
@@ -509,7 +537,7 @@ func (r *DeploymentReconciler) renderDeploymentVolumes( //nolint:funlen
 		dockerConfigSecret = r.configManagerGetter().GetDockerConfig()
 	}
 
-	if dockerConfigSecret != "" {
+	if dockerConfigSecret != "" && !nativeMode {
 		volumes = append(
 			volumes,
 			k8scorev1.Volume{
@@ -657,7 +685,10 @@ func (r *DeploymentReconciler) renderDeploymentContainer(
 	configVolumeName string,
 	volumeMountsFromCommonSpec []k8scorev1.VolumeMount,
 	owningTopology *clabernetesapisv1alpha1.Topology,
+	clabernetesConfigs map[string]*clabernetesutilcontainerlab.Config,
 ) {
+	nativeMode := ResolveNativeMode(owningTopology)
+
 	image := owningTopology.Spec.Deployment.LauncherImage
 	if image == "" {
 		image = r.configManagerGetter().GetLauncherImage()
@@ -668,7 +699,7 @@ func (r *DeploymentReconciler) renderDeploymentContainer(
 		imagePullPolicy = r.configManagerGetter().GetLauncherImagePullPolicy()
 	}
 
-	container := k8scorev1.Container{
+	launcher := k8scorev1.Container{
 		Name:       nodeName,
 		WorkingDir: "/clabernetes",
 		Image:      image,
@@ -704,23 +735,82 @@ func (r *DeploymentReconciler) renderDeploymentContainer(
 				MountPath: "/clabernetes/configured-pull-secrets.yaml",
 				SubPath:   "configured-pull-secrets",
 			},
-			{
-				Name:      "docker",
-				ReadOnly:  false,
-				MountPath: "/var/lib/docker",
-			},
 		},
 		TerminationMessagePath:   "/dev/termination-log",
 		TerminationMessagePolicy: "File",
 		ImagePullPolicy:          k8scorev1.PullPolicy(imagePullPolicy),
 	}
 
-	container.VolumeMounts = append(container.VolumeMounts, volumeMountsFromCommonSpec...)
+	if nativeMode {
+		launcher.Name = launcherContainerName
+		launcher.VolumeMounts = append(
+			launcher.VolumeMounts,
+			k8scorev1.VolumeMount{
+				Name:      nativeRuntimeVolumeName,
+				ReadOnly:  false,
+				MountPath: nativeRuntimeMountPath,
+			},
+		)
+	} else {
+		launcher.VolumeMounts = append(
+			launcher.VolumeMounts,
+			k8scorev1.VolumeMount{
+				Name:      "docker",
+				ReadOnly:  false,
+				MountPath: "/var/lib/docker",
+			},
+		)
+	}
 
-	deployment.Spec.Template.Spec.Containers = []k8scorev1.Container{container}
+	launcher.VolumeMounts = append(launcher.VolumeMounts, volumeMountsFromCommonSpec...)
+
+	if !nativeMode {
+		deployment.Spec.Template.Spec.Containers = []k8scorev1.Container{launcher}
+
+		return
+	}
+
+	setup := k8scorev1.Container{
+		Name:                     setupInitContainerName,
+		WorkingDir:               "/clabernetes",
+		Image:                    image,
+		Command:                  []string{"/clabernetes/manager", "setup"},
+		VolumeMounts:             append([]k8scorev1.VolumeMount{}, launcher.VolumeMounts...),
+		TerminationMessagePath:   "/dev/termination-log",
+		TerminationMessagePolicy: "File",
+		ImagePullPolicy:          k8scorev1.PullPolicy(imagePullPolicy),
+	}
+
+	nodeImage := clabernetesConfigs[nodeName].Topology.GetNodeImage(nodeName)
+
+	nos := k8scorev1.Container{
+		Name:                     nodeName,
+		Image:                    nodeImage,
+		ImagePullPolicy:          k8scorev1.PullIfNotPresent,
+		TerminationMessagePath:   "/dev/termination-log",
+		TerminationMessagePolicy: "File",
+	}
+
+	clabernetescontrollerstopologynativemode.ApplyNativeModeOverrides(
+		r.log,
+		&clabernetescontrollerstopologynativemode.ApplyInput{
+			OwningTopology:     owningTopology,
+			NodeName:           nodeName,
+			NodeImage:          nodeImage,
+			NodeDef:            clabernetesConfigs[nodeName].Topology.Nodes[nodeName],
+			Links:              clabernetesConfigs[nodeName].Topology.Links,
+			FilesFromConfigMap: owningTopology.Spec.Deployment.FilesFromConfigMap[nodeName],
+			Deployment:         deployment,
+			NOS:                &nos,
+		},
+	)
+
+	deployment.Spec.Template.Spec.InitContainers = []k8scorev1.Container{setup}
+	deployment.Spec.Template.Spec.Containers = []k8scorev1.Container{launcher, nos}
+	deployment.Spec.Template.Spec.ShareProcessNamespace = clabernetesutil.ToPointer(true)
 }
 
-func (r *DeploymentReconciler) renderDeploymentContainerEnv( //nolint: funlen
+func (r *DeploymentReconciler) renderDeploymentContainerEnv( //nolint:funlen,gocyclo
 	deployment *k8sappsv1.Deployment,
 	nodeName,
 	owningTopologyName string,
@@ -901,7 +991,48 @@ func (r *DeploymentReconciler) renderDeploymentContainerEnv( //nolint: funlen
 		)
 	}
 
-	deployment.Spec.Template.Spec.Containers[0].Env = envs
+	nativeMode := ResolveNativeMode(owningTopology)
+	if nativeMode {
+		envs = append(
+			envs,
+			k8scorev1.EnvVar{
+				Name:  clabernetesconstants.LauncherNativeModeEnv,
+				Value: clabernetesconstants.True,
+			},
+			k8scorev1.EnvVar{
+				Name:  clabernetesconstants.LauncherRuntimeDirEnv,
+				Value: nativeRuntimeMountPath,
+			},
+		)
+	}
+
+	launcherName := nodeName
+	if nativeMode {
+		launcherName = launcherContainerName
+	}
+
+	launcherIdx, ok := findContainerIndex(deployment.Spec.Template.Spec.Containers, launcherName)
+	if !ok {
+		r.log.Warnf(
+			"failed to locate launcher container %q in deployment %q",
+			launcherName,
+			deployment.Name,
+		)
+
+		return
+	}
+
+	deployment.Spec.Template.Spec.Containers[launcherIdx].Env = envs
+
+	if nativeMode {
+		setupIdx, ok := findContainerIndex(
+			deployment.Spec.Template.Spec.InitContainers,
+			setupInitContainerName,
+		)
+		if ok {
+			deployment.Spec.Template.Spec.InitContainers[setupIdx].Env = envs
+		}
+	}
 }
 
 func (r *DeploymentReconciler) renderDeploymentContainerResources(
@@ -910,16 +1041,27 @@ func (r *DeploymentReconciler) renderDeploymentContainerResources(
 	owningTopology *clabernetesapisv1alpha1.Topology,
 	clabernetesConfigs map[string]*clabernetesutilcontainerlab.Config,
 ) {
+	nodeIdx, ok := findContainerIndex(deployment.Spec.Template.Spec.Containers, nodeName)
+	if !ok {
+		r.log.Warnf(
+			"failed to locate node container %q in deployment %q",
+			nodeName,
+			deployment.Name,
+		)
+
+		return
+	}
+
 	nodeResources, nodeResourcesOk := owningTopology.Spec.Deployment.Resources[nodeName]
 	if nodeResourcesOk {
-		deployment.Spec.Template.Spec.Containers[0].Resources = nodeResources
+		deployment.Spec.Template.Spec.Containers[nodeIdx].Resources = nodeResources
 
 		return
 	}
 
 	defaultResources, defaultResourcesOk := owningTopology.Spec.Deployment.Resources[clabernetesconstants.Default] //nolint:lll
 	if defaultResourcesOk {
-		deployment.Spec.Template.Spec.Containers[0].Resources = defaultResources
+		deployment.Spec.Template.Spec.Containers[nodeIdx].Resources = defaultResources
 
 		return
 	}
@@ -929,7 +1071,7 @@ func (r *DeploymentReconciler) renderDeploymentContainerResources(
 	)
 
 	if resources != nil {
-		deployment.Spec.Template.Spec.Containers[0].Resources = *resources
+		deployment.Spec.Template.Spec.Containers[nodeIdx].Resources = *resources
 	}
 }
 
@@ -954,13 +1096,42 @@ func (r *DeploymentReconciler) renderDeploymentContainerPrivileges(
 	nodeName string,
 	owningTopology *clabernetesapisv1alpha1.Topology,
 ) {
+	nativeMode := ResolveNativeMode(owningTopology)
+
+	launcherName := nodeName
+	if nativeMode {
+		launcherName = launcherContainerName
+	}
+
+	launcherIdx, ok := findContainerIndex(deployment.Spec.Template.Spec.Containers, launcherName)
+	if !ok {
+		r.log.Warnf(
+			"failed to locate launcher container %q in deployment %q",
+			launcherName,
+			deployment.Name,
+		)
+
+		return
+	}
+
 	if ResolveGlobalVsTopologyBool(
 		r.configManagerGetter().GetPrivilegedLauncher(),
 		owningTopology.Spec.Deployment.PrivilegedLauncher,
 	) {
-		deployment.Spec.Template.Spec.Containers[0].SecurityContext = &k8scorev1.SecurityContext{
+		sec := &k8scorev1.SecurityContext{
 			Privileged: clabernetesutil.ToPointer(true),
 			RunAsUser:  clabernetesutil.ToPointer(int64(0)),
+		}
+		deployment.Spec.Template.Spec.Containers[launcherIdx].SecurityContext = sec
+
+		if nativeMode {
+			setupIdx, ok := findContainerIndex(
+				deployment.Spec.Template.Spec.InitContainers,
+				setupInitContainerName,
+			)
+			if ok {
+				deployment.Spec.Template.Spec.InitContainers[setupIdx].SecurityContext = sec
+			}
 		}
 
 		return
@@ -970,10 +1141,10 @@ func (r *DeploymentReconciler) renderDeploymentContainerPrivileges(
 	// after the "/" needs to be the name of the container this applies to -- in our case (for now?)
 	// this will always just be the node name
 	deployment.ObjectMeta.Annotations[fmt.Sprintf(
-		"%s/%s", "container.apparmor.security.beta.kubernetes.io", nodeName,
+		"%s/%s", "container.apparmor.security.beta.kubernetes.io", launcherName,
 	)] = "unconfined"
 
-	deployment.Spec.Template.Spec.Containers[0].SecurityContext = &k8scorev1.SecurityContext{
+	sec := &k8scorev1.SecurityContext{
 		Privileged: clabernetesutil.ToPointer(false),
 		RunAsUser:  clabernetesutil.ToPointer(int64(0)),
 		Capabilities: &k8scorev1.Capabilities{
@@ -1032,6 +1203,17 @@ func (r *DeploymentReconciler) renderDeploymentContainerPrivileges(
 			},
 		},
 	}
+
+	deployment.Spec.Template.Spec.Containers[launcherIdx].SecurityContext = sec
+	if nativeMode {
+		setupIdx, ok := findContainerIndex(
+			deployment.Spec.Template.Spec.InitContainers,
+			setupInitContainerName,
+		)
+		if ok {
+			deployment.Spec.Template.Spec.InitContainers[setupIdx].SecurityContext = sec
+		}
+	}
 }
 
 func (r *DeploymentReconciler) renderDeploymentContainerStatus(
@@ -1070,7 +1252,25 @@ func (r *DeploymentReconciler) renderDeploymentContainerStatus(
 
 	// startup probe delays the start of the readiness probe -- this gives us time for the nos to
 	// boot before we start doing the readiness check on the (slightly) faster frequency
-	deployment.Spec.Template.Spec.Containers[0].StartupProbe = &k8scorev1.Probe{
+	nativeMode := ResolveNativeMode(owningTopology)
+
+	launcherName := nodeName
+	if nativeMode {
+		launcherName = launcherContainerName
+	}
+
+	launcherIdx, ok := findContainerIndex(deployment.Spec.Template.Spec.Containers, launcherName)
+	if !ok {
+		r.log.Warnf(
+			"failed to locate launcher container %q in deployment %q",
+			launcherName,
+			deployment.Name,
+		)
+
+		return
+	}
+
+	deployment.Spec.Template.Spec.Containers[launcherIdx].StartupProbe = &k8scorev1.Probe{
 		ProbeHandler: k8scorev1.ProbeHandler{
 			Exec: &k8scorev1.ExecAction{
 				Command: []string{
@@ -1089,7 +1289,7 @@ func (r *DeploymentReconciler) renderDeploymentContainerStatus(
 
 	// after the startup probe has done its thing we set run the readiness probe -- since the
 	// launcher doenst check the status super frequently we keep this pretty slow too
-	deployment.Spec.Template.Spec.Containers[0].ReadinessProbe = &k8scorev1.Probe{
+	deployment.Spec.Template.Spec.Containers[launcherIdx].ReadinessProbe = &k8scorev1.Probe{
 		ProbeHandler: k8scorev1.ProbeHandler{
 			Exec: &k8scorev1.ExecAction{
 				Command: []string{
@@ -1141,8 +1341,8 @@ func (r *DeploymentReconciler) renderDeploymentContainerStatus(
 		}
 	}
 
-	deployment.Spec.Template.Spec.Containers[0].Env = append(
-		deployment.Spec.Template.Spec.Containers[0].Env,
+	deployment.Spec.Template.Spec.Containers[launcherIdx].Env = append(
+		deployment.Spec.Template.Spec.Containers[launcherIdx].Env,
 		probeEnvVars...,
 	)
 }
@@ -1155,8 +1355,10 @@ func (r *DeploymentReconciler) renderDeploymentDevices(
 		r.configManagerGetter().GetPrivilegedLauncher(),
 		owningTopology.Spec.Deployment.PrivilegedLauncher,
 	) {
-		// launcher is privileged, no need to mount devices explicitly
-		return
+		if !ResolveNativeMode(owningTopology) {
+			// launcher is privileged, no need to mount devices explicitly in docker-in-docker mode
+			return
+		}
 	}
 
 	// add volumes for devices we care about
@@ -1193,27 +1395,30 @@ func (r *DeploymentReconciler) renderDeploymentDevices(
 		}...,
 	)
 
-	// then mount them in our container (launchers (for now?!) only ever have the one container)
-	deployment.Spec.Template.Spec.Containers[0].VolumeMounts = append(
-		deployment.Spec.Template.Spec.Containers[0].VolumeMounts,
-		[]k8scorev1.VolumeMount{
-			{
-				Name:      "dev-kvm",
-				ReadOnly:  true,
-				MountPath: "/dev/kvm",
-			},
-			{
-				Name:      "dev-fuse",
-				ReadOnly:  true,
-				MountPath: "/dev/fuse",
-			},
-			{
-				Name:      "dev-net-tun",
-				ReadOnly:  true,
-				MountPath: "/dev/net/tun",
-			},
-		}...,
-	)
+	mounts := []k8scorev1.VolumeMount{
+		{
+			Name:      "dev-kvm",
+			ReadOnly:  true,
+			MountPath: "/dev/kvm",
+		},
+		{
+			Name:      "dev-fuse",
+			ReadOnly:  true,
+			MountPath: "/dev/fuse",
+		},
+		{
+			Name:      "dev-net-tun",
+			ReadOnly:  true,
+			MountPath: "/dev/net/tun",
+		},
+	}
+
+	for idx := range deployment.Spec.Template.Spec.Containers {
+		deployment.Spec.Template.Spec.Containers[idx].VolumeMounts = append(
+			deployment.Spec.Template.Spec.Containers[idx].VolumeMounts,
+			mounts...,
+		)
+	}
 }
 
 func (r *DeploymentReconciler) renderDeploymentPersistence(
@@ -1222,6 +1427,11 @@ func (r *DeploymentReconciler) renderDeploymentPersistence(
 	owningTopologyName string,
 	owningTopology *clabernetesapisv1alpha1.Topology,
 ) {
+	if ResolveNativeMode(owningTopology) {
+		// Persistence currently targets docker-in-docker containerlab directories.
+		return
+	}
+
 	if !owningTopology.Spec.Deployment.Persistence.Enabled {
 		return
 	}
@@ -1241,14 +1451,29 @@ func (r *DeploymentReconciler) renderDeploymentPersistence(
 		},
 	)
 
-	deployment.Spec.Template.Spec.Containers[0].VolumeMounts = append(
-		deployment.Spec.Template.Spec.Containers[0].VolumeMounts,
+	nodeIdx, ok := findContainerIndex(deployment.Spec.Template.Spec.Containers, nodeName)
+	if !ok {
+		return
+	}
+
+	deployment.Spec.Template.Spec.Containers[nodeIdx].VolumeMounts = append(
+		deployment.Spec.Template.Spec.Containers[nodeIdx].VolumeMounts,
 		k8scorev1.VolumeMount{
 			Name:      volumeName,
 			ReadOnly:  false,
 			MountPath: fmt.Sprintf("/clabernetes/clab-clabernetes-%s", nodeName),
 		},
 	)
+}
+
+func findContainerIndex(containers []k8scorev1.Container, name string) (int, bool) {
+	for idx := range containers {
+		if containers[idx].Name == name {
+			return idx, true
+		}
+	}
+
+	return 0, false
 }
 
 func determineNodeNeedsRestart(

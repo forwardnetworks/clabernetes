@@ -45,6 +45,15 @@ func ResolveTopologyRemovePrefix(t *clabernetesapisv1alpha1.Topology) bool {
 	return *t.Status.RemoveTopologyPrefix
 }
 
+// ResolveNativeMode returns true if the topology resource should run in native mode (sidecar).
+func ResolveNativeMode(t *clabernetesapisv1alpha1.Topology) bool {
+	if t.Spec.Deployment.NativeMode == nil {
+		return false
+	}
+
+	return *t.Spec.Deployment.NativeMode
+}
+
 func resolveConnectivityDestination(
 	topologyName,
 	uninterestingEndpointNodeName,

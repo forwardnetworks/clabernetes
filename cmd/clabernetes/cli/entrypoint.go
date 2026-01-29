@@ -70,6 +70,16 @@ func Entrypoint() *cli.App {
 				},
 			},
 			{
+				Name:  "setup",
+				Usage: "run the launcher setup phase (init container)",
+				Flags: []cli.Flag{},
+				Action: func(_ *cli.Context) error {
+					claberneteslauncher.StartClabernetesSetup()
+
+					return nil
+				},
+			},
+			{
 				Name:  "clicker",
 				Usage: "run the node clicker",
 				Flags: []cli.Flag{

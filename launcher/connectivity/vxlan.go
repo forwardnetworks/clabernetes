@@ -2,11 +2,14 @@ package connectivity
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"reflect"
 	"strconv"
+	"strings"
 	"time"
 
 	clabernetesapisv1alpha1 "github.com/srl-labs/clabernetes/apis/v1alpha1"
@@ -17,6 +20,7 @@ import (
 const (
 	resolveServiceMaxAttempts = 5
 	resolveServiceSleep       = 10 * time.Second
+	linuxIfNameMaxLen         = 15
 )
 
 type vxlanManager struct {
@@ -113,16 +117,32 @@ func (m *vxlanManager) runContainerlabVxlanToolsCreate(
 
 	m.logger.Debugf("resolved remote vxlan tunnel service address as '%s'", resolvedVxlanRemote)
 
-	vxlanInterfaceName := fmt.Sprintf("%s-%s", localNodeName, cntLink)
+	link := sanitizeLinuxIfName(cntLink)
+	vxlanInterfaceName := fmt.Sprintf("%s-%s", localNodeName, link)
 	m.logger.Debugf("Attempting to delete existing vxlan interface '%s'", vxlanInterfaceName)
 
-	err = m.runContainerlabVxlanToolsDelete(m.ctx, localNodeName, cntLink)
+	err = m.runContainerlabVxlanToolsDelete(m.ctx, localNodeName, link)
 	if err != nil {
 		m.logger.Warnf(
 			"failed while deleting existing vxlan interface '%s', error: '%s'",
 			vxlanInterfaceName,
 			err,
 		)
+	}
+
+	if os.Getenv(clabernetesconstants.LauncherNativeModeEnv) == clabernetesconstants.True {
+		// In docker mode, containerlab creates a veth pair per endpoint and names the "host side"
+		// of the veth `<node>-<ifname>` (e.g. `forti1-eth1`) which the vxlan tools then attach to.
+		//
+		// In native mode, we run the NOS container directly as a k8s container (no DIND), so there
+		// is no containerlab veth wiring step that would normally create this link.
+		//
+		// Since all containers in a pod share the same network namespace, we can create the
+		// expected veth pair in the pod netns: `<node>-<ifname>` <-> `<ifname>`.
+		err = m.ensurePodLinkExists(m.ctx, localNodeName, link)
+		if err != nil {
+			return err
+		}
 	}
 
 	cmd := exec.CommandContext( //nolint:gosec
@@ -136,7 +156,7 @@ func (m *vxlanManager) runContainerlabVxlanToolsCreate(
 		"--id",
 		strconv.Itoa(vxlanID),
 		"--link",
-		fmt.Sprintf("%s-%s", localNodeName, cntLink),
+		fmt.Sprintf("%s-%s", localNodeName, link),
 		"--port",
 		strconv.Itoa(clabernetesconstants.VXLANServicePort),
 	)
@@ -151,6 +171,87 @@ func (m *vxlanManager) runContainerlabVxlanToolsCreate(
 	err = cmd.Run()
 	if err != nil {
 		return err
+	}
+
+	return nil
+}
+
+func (m *vxlanManager) ensurePodLinkExists(
+	ctx context.Context,
+	localNodeName string,
+	cntLink string,
+) error {
+	hostSide := fmt.Sprintf("%s-%s", localNodeName, cntLink)
+
+	// If the host-side link already exists, we're done.
+	//nolint:gosec // hostSide is derived from sanitized interface names
+	checkCmd := exec.CommandContext(ctx, "ip", "link", "show", hostSide)
+
+	err := checkCmd.Run()
+	if err == nil {
+		return nil
+	}
+
+	// If the container-side link exists, we shouldn't clobber it.
+	checkCntCmd := exec.CommandContext(ctx, "ip", "link", "show", cntLink)
+
+	err = checkCntCmd.Run()
+	if err == nil {
+		return fmt.Errorf(
+			"%w: expected vxlan link %q missing but interface %q already exists",
+			claberneteserrors.ErrConnectivity,
+			hostSide,
+			cntLink,
+		)
+	}
+
+	//nolint:gosec // hostSide/cntLink are derived from sanitized interface names
+	addCmd := exec.CommandContext(
+		ctx,
+		"ip",
+		"link",
+		"add",
+		hostSide,
+		"type",
+		"veth",
+		"peer",
+		"name",
+		cntLink,
+	)
+	addCmd.Stdout = m.logger
+	addCmd.Stderr = m.logger
+
+	err = addCmd.Run()
+	if err != nil {
+		return errors.Join(
+			claberneteserrors.ErrConnectivity,
+			fmt.Errorf("failed creating veth %q <-> %q: %w", hostSide, cntLink, err),
+		)
+	}
+
+	//nolint:gosec // hostSide is derived from sanitized interface names
+	upHostCmd := exec.CommandContext(ctx, "ip", "link", "set", hostSide, "up")
+	upHostCmd.Stdout = m.logger
+	upHostCmd.Stderr = m.logger
+
+	err = upHostCmd.Run()
+	if err != nil {
+		return errors.Join(
+			claberneteserrors.ErrConnectivity,
+			fmt.Errorf("failed bringing up %q: %w", hostSide, err),
+		)
+	}
+
+	upCntCmd := exec.CommandContext(ctx, "ip", "link", "set", cntLink, "up")
+	upCntCmd.Stdout = m.logger
+	upCntCmd.Stderr = m.logger
+
+	err = upCntCmd.Run()
+	if err != nil {
+		return errors.Join(
+			claberneteserrors.ErrConnectivity,
+			fmt.Errorf("failed bringing up %q: %w", cntLink, err),
+		)
 	}
 
 	return nil
@@ -184,6 +285,43 @@ func (m *vxlanManager) runContainerlabVxlanToolsDelete(
 	}
 
 	return nil
+}
+
+func sanitizeLinuxIfName(raw string) string {
+	// Linux interface names must be <= 15 bytes and cannot contain '/'.
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "link"
+	}
+
+	s = strings.ReplaceAll(s, "/", "-")
+	s = strings.ReplaceAll(s, ":", "-")
+	s = strings.ReplaceAll(s, " ", "-")
+
+	b := make([]byte, 0, len(s))
+	for i := range len(s) {
+		ch := s[i]
+		switch {
+		case ch >= 'a' && ch <= 'z',
+			ch >= 'A' && ch <= 'Z',
+			ch >= '0' && ch <= '9',
+			ch == '_' || ch == '-' || ch == '.':
+			b = append(b, ch)
+		default:
+			// drop
+		}
+	}
+
+	out := string(b)
+	if out == "" {
+		out = "link"
+	}
+
+	if len(out) > linuxIfNameMaxLen {
+		out = out[:linuxIfNameMaxLen]
+	}
+
+	return strings.ToLower(out)
 }
 
 func (m *vxlanManager) updateVxlanTunnels(

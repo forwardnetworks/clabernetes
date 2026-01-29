@@ -109,17 +109,59 @@ func (c *clabernetes) startup() {
 
 	c.containerlabVersion()
 	c.setup()
-	c.image()
-	c.launch()
+
+	if os.Getenv(clabernetesconstants.LauncherNativeModeEnv) != clabernetesconstants.True {
+		c.image()
+		c.launch()
+
+		go c.imageCleanup()
+		go c.watchContainers()
+	} else {
+		c.logger.Info("native mode enabled, skipping docker image loading and containerlab deploy")
+
+		err := c.ensurePodNetFromSnapshot(c.ctx)
+		if err != nil {
+			c.logger.Warnf("failed restoring pod net from snapshot: %s", err)
+		}
+
+		// In native mode, some NOS containers mutate routes in the shared pod netns.
+		// Keep the pod/CNI routes alive so connectivity tools (vxlan/slurpeeth) can reach
+		// remote tunnel endpoints.
+		c.maybeStartVrnetlabSSHProxy()
+
+		go c.startPodNetGuardian()
+	}
+
 	c.connectivity()
 
-	go c.imageCleanup()
 	go c.runProbes()
-	go c.watchContainers()
 
 	c.logger.Info("running for forever or until sigint...")
 
 	<-c.ctx.Done()
+
+	claberneteslogging.GetManager().Flush()
+}
+
+func (c *clabernetes) setupOnly() {
+	c.logger.Info("starting clabernetes launcher setup...")
+
+	c.logger.Debugf("clabernetes version %s", clabernetesconstants.Version)
+
+	c.containerlabVersion()
+	c.setup()
+
+	err := c.capturePodNetSnapshot(c.ctx)
+	if err != nil {
+		c.logger.Warnf("failed capturing pod net snapshot: %s", err)
+	}
+
+	err = c.cacheNodeTunnels()
+	if err != nil {
+		c.logger.Fatalf("failed caching tunnels content, err: %s", err)
+	}
+
+	c.logger.Info("clabernetes launcher setup complete")
 
 	claberneteslogging.GetManager().Flush()
 }
@@ -153,6 +195,19 @@ func (c *clabernetes) setup() {
 		c.handleMounts()
 	}
 
+	if os.Getenv(clabernetesconstants.LauncherNativeModeEnv) != clabernetesconstants.True {
+		c.setupDocker()
+	}
+
+	c.logger.Debug("getting files from url if requested...")
+
+	err := c.getFilesFromURL()
+	if err != nil {
+		c.logger.Fatalf("failed getting file(s) from remote url, err: %s", err)
+	}
+}
+
+func (c *clabernetes) setupDocker() {
 	if daemonConfigExists() {
 		c.logger.Infof("%q exists, skipping insecure registries", dockerDaemonConfig)
 	} else {
@@ -167,31 +222,26 @@ func (c *clabernetes) setup() {
 	c.logger.Debug("ensuring docker is running...")
 
 	err := startDocker(c.ctx, c.logger)
-	if err != nil {
-		c.logger.Warn(
-			"failed ensuring docker is running, attempting to fallback to legacy ip tables",
-		)
-
-		// see https://github.com/srl-labs/clabernetes/issues/47
-		err = enableLegacyIPTables(c.ctx, c.logger)
-		if err != nil {
-			c.logger.Fatalf("failed enabling legacy ip tables, err: %s", err)
-		}
-
-		err = startDocker(c.ctx, c.logger)
-		if err != nil {
-			c.logger.Fatalf("failed ensuring docker is running, err: %s", err)
-		}
-
-		c.logger.Warn("docker started, but using legacy ip tables")
+	if err == nil {
+		return
 	}
 
-	c.logger.Debug("getting files from url if requested...")
+	c.logger.Warn(
+		"failed ensuring docker is running, attempting to fallback to legacy ip tables",
+	)
 
-	err = c.getFilesFromURL()
+	// see https://github.com/srl-labs/clabernetes/issues/47
+	err = enableLegacyIPTables(c.ctx, c.logger)
 	if err != nil {
-		c.logger.Fatalf("failed getting file(s) from remote url, err: %s", err)
+		c.logger.Fatalf("failed enabling legacy ip tables, err: %s", err)
 	}
+
+	err = startDocker(c.ctx, c.logger)
+	if err != nil {
+		c.logger.Fatalf("failed ensuring docker is running, err: %s", err)
+	}
+
+	c.logger.Warn("docker started, but using legacy ip tables")
 }
 
 func (c *clabernetes) launch() {
