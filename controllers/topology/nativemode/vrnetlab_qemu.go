@@ -25,6 +25,28 @@ func applyVrnetlabQemuNative(in *ApplyInput) {
 		return
 	}
 
+	upsertEnv := func(key, value string) {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return
+		}
+
+		for i := range in.NOS.Env {
+			if strings.TrimSpace(in.NOS.Env[i].Name) == key {
+				in.NOS.Env[i].Value = value
+
+				return
+			}
+		}
+
+		in.NOS.Env = append(in.NOS.Env, k8scorev1.EnvVar{Name: key, Value: value})
+	}
+
+	// In native mode we keep management connectivity on the Kubernetes pod network.
+	// Management passthrough mode requires creating tap interfaces and running tc in the
+	// NOS container, which is not guaranteed in clabernetes' native-mode security model.
+	upsertEnv("CLAB_MGMT_PASSTHROUGH", "false")
+
 	// vrnetlab qemu-based nodes generally expect a privileged container (as in the standard
 	// `docker run --privileged ...` workflow) to create TAP interfaces and attach them to
 	// the pod's veth endpoints. Keep this scoped to known qemu-based kinds.
