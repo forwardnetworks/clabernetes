@@ -26,17 +26,17 @@ func newManager(scheme *apimachineryruntime.Scheme, appName string) (ctrlruntime
 				config *rest.Config,
 				opts ctrlruntimecache.Options,
 			) (ctrlruntimecache.Cache, error) {
-				opts.DefaultLabelSelector = labels.SelectorFromSet(
-					labels.Set{
-						// only cache objects with the "clabernetes/app" label, why would we care
-						// about anything else (for now -- and we can override it with opts.ByObject
-						// anyway?! and... who the hell calls their app "clabernetes" so this should
-						// really limit the cache nicely :)
-						// currently this matters for launcher service accounts, role bindings,
-						// services (fabric and expose), and (launcher) deployments
-						"clabernetes/app": appName,
-					},
-				)
+				// NOTE: upstream clabernetes filters the default cache by "clabernetes/app" to reduce
+				// memory. In Skyforge, we routinely create namespace-scoped objects (ServiceAccounts,
+				// ConfigMaps, etc.) that may pre-exist or be created without that label (e.g., legacy
+				// resources, or objects created before clabernetes is installed).
+				//
+				// If we keep the label-filtered cache, controller-runtime Get() calls can return
+				// NotFound even when the object exists, causing reconcile loops to stall (e.g.:
+				// "ServiceAccount clabernetes-launcher-service-account not found").
+				//
+				// For Skyforge, correctness > micro-optimizations; keep the default cache unfiltered.
+				_ = appName
 
 				opts.ByObject = map[ctrlruntimeclient.Object]ctrlruntimecache.ByObject{
 					// obviously we need to cache all "our" topology objects, so do that
