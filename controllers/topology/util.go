@@ -50,7 +50,6 @@ func ResolveNativeMode(t *clabernetesapisv1alpha1.Topology) bool {
 	if t.Spec.Deployment.NativeMode == nil {
 		return false
 	}
-
 	return *t.Spec.Deployment.NativeMode
 }
 

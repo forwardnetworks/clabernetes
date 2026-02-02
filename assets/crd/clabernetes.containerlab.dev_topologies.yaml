@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.18.0
+    controller-gen.kubebuilder.io/version: v0.20.0
   name: topologies.clabernetes.containerlab.dev
 spec:
   group: clabernetes.containerlab.dev
@@ -359,6 +359,16 @@ spec:
                     - info
                     - debug
                     type: string
+                  nativeMode:
+                    description: |-
+                      NativeMode, when true, tells clabernetes to attempt to run the node image directly as a
+                      Kubernetes container (sidecar mode) instead of inside the containerlab-managed nested docker
+                      runtime.
+
+                      Native mode is useful for performance and for environments where nested container runtimes
+                      are undesirable. It is also more sensitive to node image behavior (some images assume they
+                      can freely manipulate the shared pod network namespace).
+                    type: boolean
                   persistence:
                     description: |-
                       Persistence holds configurations relating to persisting each nodes working containerlab
