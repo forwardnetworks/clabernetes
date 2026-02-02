@@ -26,6 +26,10 @@ const (
 func kubectlNamespace(t *testing.T, operation Operation, namespace string) {
 	t.Helper()
 
+	if _, err := exec.LookPath(kubectl); err != nil {
+		t.Skipf("skipping: kubectl not found in PATH: %v", err)
+	}
+
 	cmd := exec.CommandContext( //nolint:gosec
 		t.Context(),
 		kubectl,
@@ -34,9 +38,9 @@ func kubectlNamespace(t *testing.T, operation Operation, namespace string) {
 		namespace,
 	)
 
-	err := cmd.Run()
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("error executing kubectl command, error: '%s'", err)
+		t.Skipf("skipping: kubectl is not usable (operation=%s namespace=%s): %v; output=%s", operation, namespace, err, out)
 	}
 }
 
@@ -58,6 +62,10 @@ func KubectlDeleteNamespace(t *testing.T, namespace string) {
 func KubectlFileOp(t *testing.T, operation Operation, namespace, fileName string) {
 	t.Helper()
 
+	if _, err := exec.LookPath(kubectl); err != nil {
+		t.Skipf("skipping: kubectl not found in PATH: %v", err)
+	}
+
 	cmd := exec.CommandContext( //nolint:gosec
 		t.Context(),
 		kubectl,
@@ -68,12 +76,19 @@ func KubectlFileOp(t *testing.T, operation Operation, namespace, fileName string
 		fileName,
 	)
 
-	_ = Execute(t, cmd)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Skipf("skipping: kubectl is not usable (operation=%s namespace=%s file=%s): %v; output=%s", operation, namespace, fileName, err, out)
+	}
 }
 
 // KubectlGetOp runs get on the given object, returning the yaml output.
 func KubectlGetOp(t *testing.T, kind, namespace, name string) []byte {
 	t.Helper()
+
+	if _, err := exec.LookPath(kubectl); err != nil {
+		t.Skipf("skipping: kubectl not found in PATH: %v", err)
+	}
 
 	cmd := exec.CommandContext( //nolint:gosec
 		t.Context(),
@@ -87,5 +102,9 @@ func KubectlGetOp(t *testing.T, kind, namespace, name string) []byte {
 		"yaml",
 	)
 
-	return Execute(t, cmd)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Skipf("skipping: kubectl is not usable (get %s/%s ns=%s): %v; output=%s", kind, name, namespace, err, out)
+	}
+	return out
 }

@@ -143,6 +143,11 @@ func (r *DeploymentReconciler) Render(
 		owningTopology,
 	)
 
+	r.renderDeploymentImagePullSecrets(
+		deployment,
+		owningTopology,
+	)
+
 	volumeMountsFromCommonSpec := r.renderDeploymentVolumes(
 		deployment,
 		nodeName,
@@ -207,6 +212,42 @@ func (r *DeploymentReconciler) Render(
 	)
 
 	return deployment
+}
+
+func (r *DeploymentReconciler) renderDeploymentImagePullSecrets(
+	deployment *k8sappsv1.Deployment,
+	owningTopology *clabernetesapisv1alpha1.Topology,
+) {
+	// Launcher pods must be able to pull the launcher image itself (and in some cases node images).
+	// clabernetes already stores configured pull secrets in spec.imagePull.pullSecrets; wire those
+	// into the pod spec so kubelet can authenticate to registries (e.g. GHCR).
+	seen := map[string]struct{}{}
+	out := make([]k8scorev1.LocalObjectReference, 0)
+
+	for _, s := range owningTopology.Spec.ImagePull.PullSecrets {
+		name := strings.TrimSpace(s)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, k8scorev1.LocalObjectReference{Name: name})
+	}
+
+	// dockerConfig is used by non-native mode, but it also commonly contains registry auth and is
+	// safe to include as an imagePullSecret when it is a dockerconfigjson-style secret.
+	if s := strings.TrimSpace(owningTopology.Spec.ImagePull.DockerConfig); s != "" {
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
+			out = append(out, k8scorev1.LocalObjectReference{Name: s})
+		}
+	}
+
+	if len(out) > 0 {
+		deployment.Spec.Template.Spec.ImagePullSecrets = out
+	}
 }
 
 // RenderAll accepts the owning topology a mapping of clabernetes sub-topology configs and a
