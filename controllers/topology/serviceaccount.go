@@ -218,6 +218,28 @@ func (r *ServiceAccountReconciler) reconcileGetAndCreateIfNotExist( //nolint:dup
 
 		err = r.client.Create(ctx, renderedServiceAccount)
 		if err != nil {
+			// Multiple topology reconciles in the same namespace can race to create the shared
+			// launcher ServiceAccount. Treat AlreadyExists as success and fall through to Get.
+			if apimachineryerrors.IsAlreadyExists(err) {
+				r.log.Infof(
+					"launcher service account already exists in namespace %q, continuing",
+					namespace,
+				)
+				// Re-fetch to return the actual object.
+				getErr := r.client.Get(
+					ctx,
+					apimachinerytypes.NamespacedName{
+						Namespace: namespace,
+						Name:      launcherServiceAccountName(),
+					},
+					existingServiceAccount,
+				)
+				if getErr == nil {
+					return existingServiceAccount, nil
+				}
+				return existingServiceAccount, getErr
+			}
+
 			r.log.Criticalf(
 				"failed creating service account in namespace %q, error: %s",
 				namespace,
@@ -227,7 +249,8 @@ func (r *ServiceAccountReconciler) reconcileGetAndCreateIfNotExist( //nolint:dup
 			return existingServiceAccount, err
 		}
 
-		return existingServiceAccount, nil
+		// Return the created object so callers can use its state immediately.
+		return renderedServiceAccount, nil
 	}
 
 	r.log.Debugf(
