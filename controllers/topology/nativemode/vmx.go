@@ -1,6 +1,7 @@
 package nativemode
 
 import (
+	"slices"
 	"strings"
 
 	k8scorev1 "k8s.io/api/core/v1"
@@ -34,4 +35,14 @@ func applyJuniperVMX(in *ApplyInput) {
 	}
 
 	upsertEnv("CLAB_MGMT_PASSTHROUGH", "false")
+
+	// The vr-vmx vrnetlab image supports multiple datapath connection modes.
+	// In clabernetes native mode we rely on the same "tc + tap" datapath wiring
+	// that containerlab uses (bridge/tap + tc mirroring).
+	//
+	// Without this, some vrnetlab versions emit QEMU args that reference a
+	// netdev id without defining it (e.g. p01), causing QEMU startup failures.
+	if !slices.Contains(in.NOS.Args, "--connection-mode") && !slices.Contains(in.NOS.Args, "--connectionMode") {
+		in.NOS.Args = append(in.NOS.Args, "--connection-mode", "tc")
+	}
 }
