@@ -4,6 +4,7 @@ import (
 	"strconv"
 	"strings"
 
+	clabernetesutilkubernetes "github.com/srl-labs/clabernetes/util/kubernetes"
 	k8scorev1 "k8s.io/api/core/v1"
 )
 
@@ -79,6 +80,50 @@ func applyVrnetlabQemuNative(in *ApplyInput) {
 
 	if kind == "cisco_iol" || kind == "cisco_ioll2" {
 		return
+	}
+
+	// Ensure that vrnetlab's startup-config is available in the NOS container.
+	//
+	// In clabernetes native mode, FilesFromConfigMap volumes are mounted into the launcher/setup
+	// containers by default. Many vrnetlab images expect the startup config to be mounted into the
+	// NOS container at a fixed path (`/config/startup-config.cfg`). Without this mount, vrnetlab
+	// will boot with only its internal bootstrap config and any netlab-generated configuration
+	// (routed interfaces, protocols, etc.) will never be applied.
+	startupConfigPath := strings.TrimSpace(in.NodeDef.StartupConfig)
+	if startupConfigPath != "" {
+		const vrnetlabStartupConfigMount = "/config/startup-config.cfg"
+
+		existingMounts, _ := collectExistingMountsAndVolumes(in)
+		if _, ok := existingMounts[vrnetlabStartupConfigMount]; !ok {
+			for _, f := range in.FilesFromConfigMap {
+				if strings.TrimSpace(f.ConfigMapName) == "" || strings.TrimSpace(f.ConfigMapPath) == "" {
+					continue
+				}
+
+				if strings.TrimSpace(f.FilePath) != startupConfigPath {
+					continue
+				}
+
+				volumeName := clabernetesutilkubernetes.EnforceDNSLabelConvention(
+					clabernetesutilkubernetes.SafeConcatNameKubernetes(
+						f.ConfigMapName,
+						f.ConfigMapPath,
+					),
+				)
+
+				in.NOS.VolumeMounts = append(
+					in.NOS.VolumeMounts,
+					k8scorev1.VolumeMount{
+						Name:      volumeName,
+						ReadOnly:  true,
+						MountPath: vrnetlabStartupConfigMount,
+						SubPath:   f.ConfigMapPath,
+					},
+				)
+				existingMounts[vrnetlabStartupConfigMount] = struct{}{}
+				break
+			}
+		}
 	}
 
 	upsertEnv := func(key, value string) {
