@@ -36,6 +36,18 @@ func applyJuniperVMX(in *ApplyInput) {
 
 	upsertEnv("CLAB_MGMT_PASSTHROUGH", "false")
 
+	// netlab expects vMX to be reachable with admin/admin@123 by default.
+	// vrnetlab supports setting these via command-line flags.
+	if !slices.Contains(in.NOS.Args, "--hostname") && strings.TrimSpace(in.NodeName) != "" {
+		in.NOS.Args = append(in.NOS.Args, "--hostname", strings.TrimSpace(in.NodeName))
+	}
+	if !slices.Contains(in.NOS.Args, "--username") {
+		in.NOS.Args = append(in.NOS.Args, "--username", "admin")
+	}
+	if !slices.Contains(in.NOS.Args, "--password") {
+		in.NOS.Args = append(in.NOS.Args, "--password", "admin@123")
+	}
+
 	// The vr-vmx vrnetlab image supports multiple datapath connection modes.
 	// In clabernetes native mode we rely on the same "tc + tap" datapath wiring
 	// that containerlab uses (bridge/tap + tc mirroring).
