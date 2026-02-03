@@ -48,7 +48,9 @@ func ResolveTopologyRemovePrefix(t *clabernetesapisv1alpha1.Topology) bool {
 // ResolveNativeMode returns true if the topology resource should run in native mode (sidecar).
 func ResolveNativeMode(t *clabernetesapisv1alpha1.Topology) bool {
 	if t.Spec.Deployment.NativeMode == nil {
-		return false
+		// Default to native mode. Docker-in-Docker is expensive and (for many NOS images)
+		// less reliable than running the node containers directly in Kubernetes.
+		return true
 	}
 	return *t.Spec.Deployment.NativeMode
 }

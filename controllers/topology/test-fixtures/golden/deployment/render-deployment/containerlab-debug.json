@@ -41,13 +41,167 @@
                         }
                     },
                     {
-                        "name": "docker",
+                        "name": "clabernetes-runtime",
                         "emptyDir": {}
+                    },
+                    {
+                        "name": "dev-kvm",
+                        "hostPath": {
+                            "path": "/dev/kvm",
+                            "type": ""
+                        }
+                    },
+                    {
+                        "name": "dev-fuse",
+                        "hostPath": {
+                            "path": "/dev/fuse",
+                            "type": ""
+                        }
+                    },
+                    {
+                        "name": "dev-net-tun",
+                        "hostPath": {
+                            "path": "/dev/net/tun",
+                            "type": ""
+                        }
+                    }
+                ],
+                "initContainers": [
+                    {
+                        "name": "clabernetes-setup",
+                        "image": "ghcr.io/srl-labs/clabernetes/clabernetes-launcher:latest",
+                        "command": [
+                            "/clabernetes/manager",
+                            "setup"
+                        ],
+                        "workingDir": "/clabernetes",
+                        "env": [
+                            {
+                                "name": "NODE_NAME",
+                                "valueFrom": {
+                                    "fieldRef": {
+                                        "apiVersion": "v1",
+                                        "fieldPath": "spec.nodeName"
+                                    }
+                                }
+                            },
+                            {
+                                "name": "POD_NAME",
+                                "valueFrom": {
+                                    "fieldRef": {
+                                        "apiVersion": "v1",
+                                        "fieldPath": "metadata.name"
+                                    }
+                                }
+                            },
+                            {
+                                "name": "POD_NAMESPACE",
+                                "valueFrom": {
+                                    "fieldRef": {
+                                        "apiVersion": "v1",
+                                        "fieldPath": "metadata.namespace"
+                                    }
+                                }
+                            },
+                            {
+                                "name": "APP_NAME",
+                                "value": "clabernetes"
+                            },
+                            {
+                                "name": "MANAGER_NAMESPACE",
+                                "value": "clabernetes"
+                            },
+                            {
+                                "name": "LAUNCHER_CRI_KIND"
+                            },
+                            {
+                                "name": "LAUNCHER_IMAGE_PULL_THROUGH_MODE",
+                                "value": "auto"
+                            },
+                            {
+                                "name": "LAUNCHER_LOGGER_LEVEL",
+                                "value": "info"
+                            },
+                            {
+                                "name": "LAUNCHER_TOPOLOGY_NAME",
+                                "value": "render-deployment-test"
+                            },
+                            {
+                                "name": "LAUNCHER_NODE_NAME",
+                                "value": "srl1"
+                            },
+                            {
+                                "name": "LAUNCHER_NODE_IMAGE",
+                                "value": "ghcr.io/nokia/srlinux"
+                            },
+                            {
+                                "name": "LAUNCHER_NODE_KIND",
+                                "value": "srl"
+                            },
+                            {
+                                "name": "LAUNCHER_CONNECTIVITY_KIND",
+                                "value": "vxlan"
+                            },
+                            {
+                                "name": "LAUNCHER_CONTAINERLAB_VERSION"
+                            },
+                            {
+                                "name": "LAUNCHER_CONTAINERLAB_TIMEOUT"
+                            },
+                            {
+                                "name": "LAUNCHER_CONTAINERLAB_DEBUG",
+                                "value": "true"
+                            },
+                            {
+                                "name": "LAUNCHER_PRIVILEGED",
+                                "value": "true"
+                            },
+                            {
+                                "name": "LAUNCHER_NATIVE_MODE",
+                                "value": "true"
+                            },
+                            {
+                                "name": "LAUNCHER_RUNTIME_DIR",
+                                "value": "/clabernetes/runtime"
+                            }
+                        ],
+                        "resources": {},
+                        "volumeMounts": [
+                            {
+                                "name": "render-deployment-test-config",
+                                "readOnly": true,
+                                "mountPath": "/clabernetes/topo.clab.yaml",
+                                "subPath": "srl1"
+                            },
+                            {
+                                "name": "render-deployment-test-config",
+                                "readOnly": true,
+                                "mountPath": "/clabernetes/files-from-url.yaml",
+                                "subPath": "srl1-files-from-url"
+                            },
+                            {
+                                "name": "render-deployment-test-config",
+                                "readOnly": true,
+                                "mountPath": "/clabernetes/configured-pull-secrets.yaml",
+                                "subPath": "configured-pull-secrets"
+                            },
+                            {
+                                "name": "clabernetes-runtime",
+                                "mountPath": "/clabernetes/runtime"
+                            }
+                        ],
+                        "terminationMessagePath": "/dev/termination-log",
+                        "terminationMessagePolicy": "File",
+                        "imagePullPolicy": "IfNotPresent",
+                        "securityContext": {
+                            "privileged": true,
+                            "runAsUser": 0
+                        }
                     }
                 ],
                 "containers": [
                     {
-                        "name": "srl1",
+                        "name": "clabernetes-launcher",
                         "image": "ghcr.io/srl-labs/clabernetes/clabernetes-launcher:latest",
                         "command": [
                             "/clabernetes/manager",
@@ -146,6 +300,14 @@
                             {
                                 "name": "LAUNCHER_PRIVILEGED",
                                 "value": "true"
+                            },
+                            {
+                                "name": "LAUNCHER_NATIVE_MODE",
+                                "value": "true"
+                            },
+                            {
+                                "name": "LAUNCHER_RUNTIME_DIR",
+                                "value": "/clabernetes/runtime"
                             }
                         ],
                         "resources": {},
@@ -169,8 +331,21 @@
                                 "subPath": "configured-pull-secrets"
                             },
                             {
-                                "name": "docker",
-                                "mountPath": "/var/lib/docker"
+                                "name": "clabernetes-runtime",
+                                "mountPath": "/clabernetes/runtime"
+                            },
+                            {
+                                "name": "dev-kvm",
+                                "mountPath": "/dev/kvm"
+                            },
+                            {
+                                "name": "dev-fuse",
+                                "readOnly": true,
+                                "mountPath": "/dev/fuse"
+                            },
+                            {
+                                "name": "dev-net-tun",
+                                "mountPath": "/dev/net/tun"
                             }
                         ],
                         "terminationMessagePath": "/dev/termination-log",
@@ -180,10 +355,34 @@
                             "privileged": true,
                             "runAsUser": 0
                         }
+                    },
+                    {
+                        "name": "srl1",
+                        "image": "ghcr.io/nokia/srlinux",
+                        "resources": {},
+                        "volumeMounts": [
+                            {
+                                "name": "dev-kvm",
+                                "mountPath": "/dev/kvm"
+                            },
+                            {
+                                "name": "dev-fuse",
+                                "readOnly": true,
+                                "mountPath": "/dev/fuse"
+                            },
+                            {
+                                "name": "dev-net-tun",
+                                "mountPath": "/dev/net/tun"
+                            }
+                        ],
+                        "terminationMessagePath": "/dev/termination-log",
+                        "terminationMessagePolicy": "File",
+                        "imagePullPolicy": "IfNotPresent"
                     }
                 ],
                 "restartPolicy": "Always",
                 "serviceAccountName": "clabernetes-launcher-service-account",
+                "shareProcessNamespace": true,
                 "hostname": "srl1"
             }
         },
