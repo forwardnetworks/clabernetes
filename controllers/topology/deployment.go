@@ -824,10 +824,17 @@ func (r *DeploymentReconciler) renderDeploymentContainer(
 
 	nodeImage := clabernetesConfigs[nodeName].Topology.GetNodeImage(nodeName)
 
+	nodePullPolicy := k8scorev1.PullIfNotPresent
+	// vrnetlab images are huge and we often iterate on them during Skyforge development.
+	// Use PullAlways so a new tag digest is picked up even if the tag is unchanged.
+	if strings.Contains(nodeImage, "/vrnetlab/") {
+		nodePullPolicy = k8scorev1.PullAlways
+	}
+
 	nos := k8scorev1.Container{
 		Name:                     nodeName,
 		Image:                    nodeImage,
-		ImagePullPolicy:          k8scorev1.PullIfNotPresent,
+		ImagePullPolicy:          nodePullPolicy,
 		TerminationMessagePath:   "/dev/termination-log",
 		TerminationMessagePolicy: "File",
 	}
