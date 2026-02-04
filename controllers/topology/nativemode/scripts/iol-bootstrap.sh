@@ -4,7 +4,17 @@ node="${SKYFORGE_NODE_NAME:?SKYFORGE_NODE_NAME is required}"
 echo "[clabernetes] vrnetlab iol bootstrap starting (node=${node} pid=${IOL_PID})"
 
 IFS=',' read -r -a link_ifaces <<< "${SKYFORGE_IOL_LINK_IFACES:-}"
-for ifn in "${link_ifaces[@]}"; do
+
+# vrnetlab native mode uses an internal management veth pair created by the launcher:
+# - host side: vrl-mgmt0 (169.254.100.1/30)
+# - IOS side:  vrl-mgmt1 (attached to IOS Ethernet0/0 via iouyap)
+# The launcher runs a TCP proxy on podIP:22 -> 169.254.100.2:22.
+MGMT_IOS_DEV="vrl-mgmt1"
+MGMT_IOS_IP="169.254.100.2"
+MGMT_IOS_MASK="255.255.255.252"
+
+wait_ifaces=("${link_ifaces[@]}" "${MGMT_IOS_DEV}")
+for ifn in "${wait_ifaces[@]}"; do
   if [ -z "$ifn" ]; then
     continue
   fi
@@ -35,27 +45,8 @@ touch "/vrnetlab/${SKYFORGE_IOL_NVRAM}"
 } > /vrnetlab/NETMAP
 
 # Build /iol/config.txt (IOS boot config) similar to containerlab's iol kind driver.
-#
-# Important: do NOT "steal" the Kubernetes pod IP (eth0) for IOS management.
-# In CNI setups where pod IPs are /32 and routed, moving the pod IP
-# into the VM breaks pod routing and makes the pod unreachable from other nodes.
-#
-# Instead, create an internal management veth pair:
-# - host side: vrl-mgmt0 (169.254.100.1/30)
-# - IOS side:  vrl-mgmt1 (attached to IOS Ethernet0/0 via iouyap)
-# The clabernetes launcher will run a TCP proxy on podIP:22 -> 169.254.100.2:22.
-MGMT_HOST_DEV="vrl-mgmt0"
-MGMT_IOS_DEV="vrl-mgmt1"
-MGMT_HOST_IP="169.254.100.1/30"
-MGMT_IOS_IP="169.254.100.2"
-MGMT_IOS_MASK="255.255.255.252"
-
-if ! ip link show "${MGMT_HOST_DEV}" >/dev/null 2>&1; then
-  ip link add "${MGMT_HOST_DEV}" type veth peer name "${MGMT_IOS_DEV}"
-fi
-ip link set "${MGMT_HOST_DEV}" up
-ip link set "${MGMT_IOS_DEV}" up
-ip addr replace "${MGMT_HOST_IP}" dev "${MGMT_HOST_DEV}"
+# Note: the management veth pair is created by the launcher; the IOS container does not
+# have NET_ADMIN and must not attempt to create or reconfigure host-side interfaces.
 
 # IOUYAP config mapping bay/unit ports to linux ifaces.
 {
@@ -191,4 +182,3 @@ slots=$(( (ports + 3) / 4 ))
 echo "[clabernetes] starting iol.bin (slots=$slots ports=$ports mgmt=${MGMT_IOS_IP}/${MGMT_IOS_MASK})"
 cd /iol
 exec ./iol.bin "$IOL_PID" -e "$slots" -s 0 -c config.txt -n 1024
-
