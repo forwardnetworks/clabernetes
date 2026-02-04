@@ -40,6 +40,7 @@ RUN apt-get update && \
     lsb-release \
     vim \
     iproute2 \
+    ethtool \
     tcpdump \
     procps \
     openssh-client \
