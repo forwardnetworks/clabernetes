@@ -229,29 +229,39 @@ func collectIOLLinkIfaces(in *ApplyInput) []string {
 }
 
 func sanitizeLinuxIfName(s string) string {
+	// Keep this consistent with the launcher vxlan sanitization:
+	// - replace interface separators with '-'
+	// - drop unknown characters
+	// - enforce Linux IFNAMSIZ (15 bytes)
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return ""
 	}
 
-	out := make([]rune, 0, len(s))
-	for _, r := range s {
-		if (r >= 'a' && r <= 'z') ||
-			(r >= 'A' && r <= 'Z') ||
-			(r >= '0' && r <= '9') ||
-			r == '_' ||
-			r == '-' {
-			out = append(out, r)
+	s = strings.ReplaceAll(s, "/", "-")
+	s = strings.ReplaceAll(s, ":", "-")
+	s = strings.ReplaceAll(s, " ", "-")
 
-			continue
+	b := make([]byte, 0, len(s))
+	for i := range len(s) {
+		ch := s[i]
+		switch {
+		case ch >= 'a' && ch <= 'z',
+			ch >= 'A' && ch <= 'Z',
+			ch >= '0' && ch <= '9',
+			ch == '_' || ch == '-' || ch == '.':
+			b = append(b, ch)
+		default:
+			// drop
 		}
-
-		out = append(out, '_')
 	}
 
+	out := strings.ToLower(string(b))
+	if out == "" {
+		return ""
+	}
 	if len(out) > linuxIfNameMaxLen {
 		out = out[:linuxIfNameMaxLen]
 	}
-
-	return strings.ToLower(string(out))
+	return out
 }

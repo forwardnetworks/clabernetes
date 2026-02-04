@@ -2,6 +2,8 @@ package connectivity
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -21,6 +23,8 @@ const (
 	resolveServiceMaxAttempts = 5
 	resolveServiceSleep       = 10 * time.Second
 	linuxIfNameMaxLen         = 15
+	vxlanIfPrefix             = "vx-"
+	vxlanHostSideMaxLen       = linuxIfNameMaxLen - len(vxlanIfPrefix) // keep room for vxlan tools interface names
 )
 
 type vxlanManager struct {
@@ -118,10 +122,11 @@ func (m *vxlanManager) runContainerlabVxlanToolsCreate(
 	m.logger.Debugf("resolved remote vxlan tunnel service address as '%s'", resolvedVxlanRemote)
 
 	link := sanitizeLinuxIfName(cntLink)
-	vxlanInterfaceName := fmt.Sprintf("%s-%s", localNodeName, link)
+	hostSide := vxlanHostSideLinkName(localNodeName, link)
+	vxlanInterfaceName := fmt.Sprintf("%s%s", vxlanIfPrefix, hostSide)
 	m.logger.Debugf("Attempting to delete existing vxlan interface '%s'", vxlanInterfaceName)
 
-	err = m.runContainerlabVxlanToolsDelete(m.ctx, localNodeName, link)
+	err = m.runContainerlabVxlanToolsDelete(m.ctx, hostSide)
 	if err != nil {
 		m.logger.Warnf(
 			"failed while deleting existing vxlan interface '%s', error: '%s'",
@@ -139,7 +144,7 @@ func (m *vxlanManager) runContainerlabVxlanToolsCreate(
 		//
 		// Since all containers in a pod share the same network namespace, we can create the
 		// expected veth pair in the pod netns: `<node>-<ifname>` <-> `<ifname>`.
-		err = m.ensurePodLinkExists(m.ctx, localNodeName, link)
+		err = m.ensurePodLinkExists(m.ctx, hostSide, link)
 		if err != nil {
 			return err
 		}
@@ -156,7 +161,7 @@ func (m *vxlanManager) runContainerlabVxlanToolsCreate(
 		"--id",
 		strconv.Itoa(vxlanID),
 		"--link",
-		fmt.Sprintf("%s-%s", localNodeName, link),
+		hostSide,
 		"--port",
 		strconv.Itoa(clabernetesconstants.VXLANServicePort),
 	)
@@ -178,11 +183,9 @@ func (m *vxlanManager) runContainerlabVxlanToolsCreate(
 
 func (m *vxlanManager) ensurePodLinkExists(
 	ctx context.Context,
-	localNodeName string,
+	hostSide string,
 	cntLink string,
 ) error {
-	hostSide := fmt.Sprintf("%s-%s", localNodeName, cntLink)
-
 	// If the host-side link already exists, we're done.
 	//nolint:gosec // hostSide is derived from sanitized interface names
 	checkCmd := exec.CommandContext(ctx, "ip", "link", "show", hostSide)
@@ -259,8 +262,7 @@ func (m *vxlanManager) ensurePodLinkExists(
 
 func (m *vxlanManager) runContainerlabVxlanToolsDelete(
 	ctx context.Context,
-	localNodeName,
-	cntLink string,
+	hostSide string,
 ) error {
 	cmd := exec.CommandContext( //nolint:gosec
 		ctx,
@@ -269,7 +271,7 @@ func (m *vxlanManager) runContainerlabVxlanToolsDelete(
 		"vxlan",
 		"delete",
 		"--prefix",
-		fmt.Sprintf("vx-%s-%s", localNodeName, cntLink),
+		fmt.Sprintf("%s%s", vxlanIfPrefix, hostSide),
 	)
 
 	m.logger.Debugf(
@@ -285,6 +287,51 @@ func (m *vxlanManager) runContainerlabVxlanToolsDelete(
 	}
 
 	return nil
+}
+
+func vxlanHostSideLinkName(localNodeName, cntLink string) string {
+	base := fmt.Sprintf("%s-%s", localNodeName, cntLink)
+	if len(base) <= vxlanHostSideMaxLen {
+		return base
+	}
+
+	sum := sha1.Sum([]byte(base))
+	hash := hex.EncodeToString(sum[:])
+	if len(hash) < vxlanHostSideMaxLen {
+		// should never happen, but be defensive.
+		return hash
+	}
+
+	node := sanitizeLinuxIfName(localNodeName)
+	if node == "" {
+		node = "n"
+	}
+	if len(node) > 3 {
+		node = node[:3]
+	}
+
+	link := cntLink
+	if link == "" {
+		link = "l"
+	}
+	if len(link) > 3 {
+		link = link[:3]
+	}
+
+	remain := vxlanHostSideMaxLen - (len(node) + len(link))
+	if remain <= 0 {
+		out := node + link
+		if len(out) > vxlanHostSideMaxLen {
+			out = out[:vxlanHostSideMaxLen]
+		}
+		return out
+	}
+
+	out := node + link + hash[:remain]
+	if len(out) > vxlanHostSideMaxLen {
+		out = out[:vxlanHostSideMaxLen]
+	}
+	return out
 }
 
 func sanitizeLinuxIfName(raw string) string {
@@ -345,11 +392,9 @@ func (m *vxlanManager) updateVxlanTunnels(
 			continue
 		}
 
-		err := m.runContainerlabVxlanToolsDelete(
-			m.ctx,
-			existingTunnel.LocalNode,
-			existingTunnel.LocalInterface,
-		)
+		link := sanitizeLinuxIfName(existingTunnel.LocalInterface)
+		hostSide := vxlanHostSideLinkName(existingTunnel.LocalNode, link)
+		err := m.runContainerlabVxlanToolsDelete(m.ctx, hostSide)
 		if err != nil {
 			m.logger.Fatalf(
 				"failed deleting extraneous tunnel to remote node '%s' for local interface '%s'"+
@@ -375,11 +420,9 @@ func (m *vxlanManager) updateVxlanTunnels(
 		if ok {
 			// tunnel for this interface exists but isnt the same as our desired setup, delete the
 			// old tunnel before we create the new one
-			err := m.runContainerlabVxlanToolsDelete(
-				m.ctx,
-				tunnel.LocalNode,
-				tunnel.LocalInterface,
-			)
+			link := sanitizeLinuxIfName(tunnel.LocalInterface)
+			hostSide := vxlanHostSideLinkName(tunnel.LocalNode, link)
+			err := m.runContainerlabVxlanToolsDelete(m.ctx, hostSide)
 			if err != nil {
 				m.logger.Fatalf(
 					"failed deleting existing tunnel to remote node '%s' for local interface '%s'"+
