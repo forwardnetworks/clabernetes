@@ -1708,15 +1708,16 @@ exec ./iol.bin "$IOL_PID" -e "$slots" -s 0 -c config.txt -n 1024
 			}
 		}
 
-		// vrnetlab ASAv images require `--connection-mode tc` to generate valid QEMU netdevs
-		// for provisioned data-plane interfaces (eth1, eth2, ...). Containerlab commonly
-		// passes this via `cmd:`; netlab-generated topologies often omit it.
+		// vrnetlab qemu-based NOS images commonly require `--connection-mode tc` to generate
+		// valid QEMU netdevs for provisioned data-plane interfaces (eth1, eth2, ...).
 		//
+		// Containerlab typically passes this via `cmd:`; netlab-generated topologies often omit it.
 		// Keep user-specified args intact: only apply this when no args were provided.
 		{
-			k := strings.ToLower(strings.TrimSpace(nodeDef.Kind))
 			img := strings.ToLower(strings.TrimSpace(nodeImage))
-			if len(nosContainer.Args) == 0 && (k == "cisco_asav" || strings.Contains(img, "/cisco_asav") || strings.Contains(img, "/vrnetlab/cisco_asav")) {
+			// Match both public and GHCR-prefixed images.
+			isVrnetlab := strings.HasPrefix(img, "vrnetlab/") || strings.Contains(img, "/vrnetlab/")
+			if len(nosContainer.Args) == 0 && isVrnetlab {
 				nosContainer.Args = []string{"--connection-mode", "tc"}
 			}
 		}
