@@ -16,6 +16,7 @@ import (
 const (
 	vrnetlabMgmtSSHAddr = "169.254.100.2:22"
 	sshProxyListenAddr  = ":22"
+	sshProxyAltPort     = 2222
 )
 
 func (c *clabernetes) maybeStartVrnetlabSSHProxy() {
@@ -27,6 +28,7 @@ func (c *clabernetes) maybeStartVrnetlabSSHProxy() {
 	if img == "" || !strings.Contains(img, "/vrnetlab/") {
 		return
 	}
+	isASAv := strings.Contains(img, "/vrnetlab/cisco_asav")
 
 	// vrnetlab uses iouyap/qemu user-space networking which does not handle
 	// CHECKSUM_PARTIAL / TSO/GSO packets well on veth pairs. Disable offloads on
@@ -55,6 +57,23 @@ func (c *clabernetes) maybeStartVrnetlabSSHProxy() {
 			dialTimeout     = 200 * time.Millisecond
 		)
 
+		// ASAv frequently binds TCP/22 inside the pod netns, which prevents us from
+		// starting a proxy on :22. However, in k8s/native mode the most reliable SSH
+		// path is via vrnetlab's mgmt veth (169.254.100.2:22). To avoid port conflicts,
+		// we:
+		// 1) run the proxy on a high local port (2222)
+		// 2) redirect incoming TCP/22 to 2222 using iptables (best effort)
+		//
+		// This keeps the external endpoint stable (port 22) while avoiding races with
+		// QEMU hostfwd.
+		if isASAv {
+			c.ensurePortRedirectTCP(22, sshProxyAltPort)
+			if err := runTCPProxy(c.ctx, fmt.Sprintf(":%d", sshProxyAltPort), vrnetlabMgmtSSHAddr); err != nil {
+				c.logger.Warnf("vrnetlab ssh proxy (asav) failed: %s", err)
+			}
+			return
+		}
+
 		select {
 		case <-time.After(waitBeforeProxy):
 		case <-c.ctx.Done():
@@ -74,6 +93,46 @@ func (c *clabernetes) maybeStartVrnetlabSSHProxy() {
 		}
 	}()
 	c.logger.Infof("vrnetlab ssh proxy armed (will start if port 22 is free): %s -> %s", sshProxyListenAddr, vrnetlabMgmtSSHAddr)
+}
+
+func (c *clabernetes) ensurePortRedirectTCP(fromPort, toPort int) {
+	if fromPort <= 0 || toPort <= 0 || fromPort == toPort {
+		return
+	}
+	_, err := exec.LookPath("iptables")
+	if err != nil {
+		c.logger.Warnf("iptables not found; cannot redirect tcp/%d -> %d", fromPort, toPort)
+		return
+	}
+
+	// Best effort: keep trying a couple times to avoid transient failures early in boot.
+	argsCheck := []string{
+		"-t", "nat",
+		"-C", "PREROUTING",
+		"-p", "tcp",
+		"--dport", fmt.Sprintf("%d", fromPort),
+		"-j", "REDIRECT",
+		"--to-ports", fmt.Sprintf("%d", toPort),
+	}
+	if err := exec.CommandContext(c.ctx, "iptables", argsCheck...).Run(); err == nil {
+		c.logger.Infof("iptables redirect already present: tcp/%d -> %d", fromPort, toPort)
+		return
+	}
+
+	argsInsert := []string{
+		"-t", "nat",
+		"-I", "PREROUTING", "1",
+		"-p", "tcp",
+		"--dport", fmt.Sprintf("%d", fromPort),
+		"-j", "REDIRECT",
+		"--to-ports", fmt.Sprintf("%d", toPort),
+	}
+	out, err := exec.CommandContext(c.ctx, "iptables", argsInsert...).CombinedOutput()
+	if err != nil {
+		c.logger.Warnf("failed adding iptables redirect tcp/%d -> %d: %v (%s)", fromPort, toPort, err, strings.TrimSpace(string(out)))
+		return
+	}
+	c.logger.Infof("installed iptables redirect: tcp/%d -> %d", fromPort, toPort)
 }
 
 func (c *clabernetes) ensureVrnetlabMgmtVeth() error {
