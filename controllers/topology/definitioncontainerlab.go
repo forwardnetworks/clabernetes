@@ -632,6 +632,62 @@ func (p *containerlabDefinitionProcessor) processLinksForNodeGroup(
 	secondaryNodes map[string]string,
 	removeTopologyPrefix bool,
 ) error {
+	// Some vrnetlab-based NOS images have hard requirements on dataplane interface names.
+	//
+	// In particular, Cisco ASAv expects Linux interface names like eth1, eth2, ... for its
+	// provisioned dataplane ports. Netlab can emit platform-style interface names in the
+	// containerlab link endpoints (for example, Gi0/0), which would create vxlan interfaces
+	// with those names and cause ASAv bootstrap to hang waiting for eth*.
+	//
+	// Normalize ASAv link endpoints to eth* deterministically within this node group.
+	asavIfaceMap := map[string]map[string]string{} // node -> original iface -> ethN
+	asavNext := map[string]int{}                   // node -> next eth index
+	isASAv := func(node string) bool {
+		if containerlabConfig == nil || containerlabConfig.Topology == nil {
+			return false
+		}
+		kind, _ := containerlabConfig.Topology.GetNodeKindType(node)
+		kind = strings.ToLower(strings.TrimSpace(kind))
+		img := strings.ToLower(strings.TrimSpace(containerlabConfig.Topology.GetNodeImage(node)))
+		return kind == "cisco_asav" || kind == "asav" || strings.Contains(img, "/vrnetlab/cisco_asav") || strings.Contains(img, "vrnetlab/cisco_asav")
+	}
+	rewriteASAvEndpoints := func(link *clabernetesutilcontainerlab.LinkDefinition) {
+		if link == nil || len(link.Endpoints) == 0 {
+			return
+		}
+		for i := range link.Endpoints {
+			ep := strings.TrimSpace(link.Endpoints[i])
+			parts := strings.SplitN(ep, ":", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			node := strings.TrimSpace(parts[0])
+			ifName := strings.TrimSpace(parts[1])
+			if node == "" || ifName == "" {
+				continue
+			}
+			if !isASAv(node) {
+				continue
+			}
+			// If the endpoint is already eth*, leave it alone.
+			if strings.HasPrefix(strings.ToLower(ifName), "eth") {
+				continue
+			}
+			m := asavIfaceMap[node]
+			if m == nil {
+				m = map[string]string{}
+				asavIfaceMap[node] = m
+			}
+			newIf, ok := m[ifName]
+			if !ok {
+				asavNext[node]++
+				newIf = fmt.Sprintf("eth%d", asavNext[node])
+				m[ifName] = newIf
+			}
+			link.Endpoints[i] = fmt.Sprintf("%s:%s", node, newIf)
+		}
+	}
+
 	for _, link := range containerlabConfig.Topology.Links {
 		// Support containerlab single-ended dummy links (netlab uses these to model unused ports).
 		//
@@ -648,6 +704,8 @@ func (p *containerlabDefinitionProcessor) processLinksForNodeGroup(
 				link.Endpoints = []string{fmt.Sprintf("%s:%s", node, ifName)}
 			}
 		}
+
+		rewriteASAvEndpoints(link)
 
 		// Handle one-ended dummy link for this node without overlay tunnels.
 		if strings.EqualFold(link.Type, "dummy") && len(link.Endpoints) == 1 {
