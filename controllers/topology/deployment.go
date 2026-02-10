@@ -1586,11 +1586,30 @@ exec ./iol.bin "$IOL_PID" -e "$slots" -s 0 -c config.txt -n 1024
 				// Instead, if this bind source matches an entry in FilesFromConfigMap for this node,
 				// mount that ConfigMap file directly into the NOS container at the desired path.
 				if strings.HasPrefix(hostPath, "/tmp/skyforge-c9s/") {
+					hostPathClean := filepath.Clean(hostPath)
 					for _, f := range owningTopology.Spec.Deployment.FilesFromConfigMap[nodeName] {
 						if strings.TrimSpace(f.ConfigMapName) == "" || strings.TrimSpace(f.ConfigMapPath) == "" {
 							continue
 						}
-						if strings.TrimSpace(f.FilePath) != hostPath {
+						// The Skyforge "filesFromConfigMap" producer isn't guaranteed to set filePath to
+						// the exact absolute path referenced in containerlab binds. In some cases it will
+						// set filePath to a base directory and configMapPath to the relative filename
+						// within that directory (for example: filePath=/tmp/.../interfaces and
+						// configMapPath=interfaces, while the bind uses /tmp/.../interfaces/interfaces).
+						//
+						// Accept both shapes so we reliably mount the ConfigMap volume instead of
+						// translating /tmp/skyforge-c9s paths into HostPath mounts (which would create
+						// empty directories on the node and crashloop the NOS container).
+						fFilePath := strings.TrimSpace(f.FilePath)
+						if fFilePath == "" {
+							continue
+						}
+						fFilePathClean := filepath.Clean(fFilePath)
+						altPathClean := ""
+						if cfg := strings.TrimSpace(f.ConfigMapPath); cfg != "" {
+							altPathClean = filepath.Clean(filepath.Join(fFilePathClean, cfg))
+						}
+						if fFilePathClean != hostPathClean && (altPathClean == "" || altPathClean != hostPathClean) {
 							continue
 						}
 						volumeName := clabernetesutilkubernetes.EnforceDNSLabelConvention(
