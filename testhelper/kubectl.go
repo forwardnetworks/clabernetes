@@ -9,6 +9,23 @@ const (
 	kubectl = "kubectl"
 )
 
+func ensureKubectl(t *testing.T) {
+	t.Helper()
+
+	// These helpers are used by e2e tests. When running in environments without
+	// a configured Kubernetes cluster (e.g. local unit test runs), skip cleanly
+	// instead of hard failing.
+	if _, err := exec.LookPath(kubectl); err != nil {
+		t.Skipf("kubectl not available: %v", err)
+	}
+
+	// If kubectl can't reach a cluster/context, we can't run the e2e tests.
+	cmd := exec.CommandContext(t.Context(), kubectl, "cluster-info") //nolint:gosec
+	if err := cmd.Run(); err != nil {
+		t.Skipf("kubectl cluster not available: %v", err)
+	}
+}
+
 // Operation represents a kubectl operation type, i.e. apply or delete.
 type Operation string
 
@@ -25,6 +42,8 @@ const (
 
 func kubectlNamespace(t *testing.T, operation Operation, namespace string) {
 	t.Helper()
+
+	ensureKubectl(t)
 
 	cmd := exec.CommandContext( //nolint:gosec
 		t.Context(),
@@ -58,6 +77,8 @@ func KubectlDeleteNamespace(t *testing.T, namespace string) {
 func KubectlFileOp(t *testing.T, operation Operation, namespace, fileName string) {
 	t.Helper()
 
+	ensureKubectl(t)
+
 	cmd := exec.CommandContext( //nolint:gosec
 		t.Context(),
 		kubectl,
@@ -74,6 +95,8 @@ func KubectlFileOp(t *testing.T, operation Operation, namespace, fileName string
 // KubectlGetOp runs get on the given object, returning the yaml output.
 func KubectlGetOp(t *testing.T, kind, namespace, name string) []byte {
 	t.Helper()
+
+	ensureKubectl(t)
 
 	cmd := exec.CommandContext( //nolint:gosec
 		t.Context(),

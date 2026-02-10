@@ -155,6 +155,15 @@ func resolveVXLANServiceViaKubeAPI(ctx context.Context, vxlanRemote string) (str
 				return addr.IP, nil
 			}
 		}
+		// If the remote launcher isn't Ready yet, Kubernetes will put the Pod IP into
+		// NotReadyAddresses. Using this breaks a Ready<->VXLAN bootstrap deadlock where
+		// each launcher waits for the other's endpoints to become Ready before it marks
+		// itself Ready.
+		for _, addr := range subset.NotReadyAddresses {
+			if addr.IP != "" {
+				return addr.IP, nil
+			}
+		}
 	}
 
 	return "", fmt.Errorf("%w: no endpoint addresses found for %s/%s", claberneteserrors.ErrConnectivity, namespace, serviceName)
@@ -198,7 +207,8 @@ func (m *vxlanManager) runContainerlabVxlanToolsCreate(
 	m.logger.Debugf("resolved remote vxlan tunnel service address as '%s'", resolvedVxlanRemote)
 
 	link := sanitizeLinuxIfName(cntLink)
-	vxlanInterfaceName := fmt.Sprintf("%s-%s", localNodeName, link)
+	hostLink := sanitizeLinuxIfName(fmt.Sprintf("%s-%s", localNodeName, link))
+	vxlanInterfaceName := hostLink
 	m.logger.Debugf("Attempting to delete existing vxlan interface '%s'", vxlanInterfaceName)
 
 	err = m.runContainerlabVxlanToolsDelete(m.ctx, localNodeName, link)
@@ -234,7 +244,7 @@ func (m *vxlanManager) runContainerlabVxlanToolsCreate(
 		"--id",
 		strconv.Itoa(vxlanID),
 		"--link",
-		fmt.Sprintf("%s-%s", localNodeName, link),
+		hostLink,
 		"--port",
 		strconv.Itoa(clabernetesconstants.VXLANServicePort),
 	)
@@ -259,7 +269,10 @@ func (m *vxlanManager) ensurePodLinkExists(
 	localNodeName string,
 	cntLink string,
 ) error {
-	hostSide := fmt.Sprintf("%s-%s", localNodeName, cntLink)
+	// Linux ifnames must be <= 15 bytes. Some NOSes have long port names (for example
+	// "GigabitEthernet0/0") and our `<node>-<ifname>` convention can exceed that.
+	// Match containerlab's behavior by sanitizing/truncating the full host-side name.
+	hostSide := sanitizeLinuxIfName(fmt.Sprintf("%s-%s", localNodeName, cntLink))
 
 	// If the host-side link already exists, we're done.
 	checkCmd := exec.CommandContext(ctx, "ip", "link", "show", hostSide) //nolint:gosec
@@ -381,7 +394,7 @@ func sanitizeLinuxIfName(raw string) string {
 		return s
 	}
 
-	sum := sha1.Sum([]byte(s)) //nolint:gosec // non-crypto identifier
+	sum := sha1.Sum([]byte(s))           //nolint:gosec // non-crypto identifier
 	suffix := fmt.Sprintf("%x", sum[:3]) // 6 chars
 	prefixLen := 15 - 1 - len(suffix)
 	if prefixLen < 1 {

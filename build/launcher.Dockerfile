@@ -1,4 +1,5 @@
-FROM golang:1.24-bookworm AS builder
+# Use a public mirror to avoid Docker Hub unauthenticated pull rate limits.
+FROM public.ecr.aws/docker/library/golang:1.24-bookworm AS builder
 
 ARG VERSION
 
@@ -21,7 +22,7 @@ RUN CGO_ENABLED=0 \
     build/manager \
     cmd/clabernetes/main.go
 
-FROM debian:bookworm-slim
+FROM public.ecr.aws/docker/library/debian:bookworm-slim
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 

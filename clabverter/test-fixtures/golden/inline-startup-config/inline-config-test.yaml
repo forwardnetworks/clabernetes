@@ -42,6 +42,8 @@ spec:
         filePath: /clabernetes/startup-config
         mode: read
     filesFromURL: null
+    hostNetwork: null
+    nativeMode: null
     persistence:
       enabled: false
     privilegedLauncher: null

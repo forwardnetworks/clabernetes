@@ -42,11 +42,38 @@ func (c *clabernetes) maybeStartVrnetlabSSHProxy() {
 	c.disableInterfaceOffloads("vrl-mgmt1")
 
 	go func() {
+		// Many vrnetlab images start QEMU with user networking and bind hostfwd ports
+		// (including TCP/22) inside the pod netns. If we bind :22 first, QEMU will fail
+		// to start. Give the NOS/QEMU ample time to bind its ports first; if :22 is still
+		// unused after that grace period, we fall back to a simple TCP proxy to the
+		// internal mgmt veth.
+		const (
+			// Some NOS images take >60s before QEMU binds hostfwd ports (esp. with large
+			// disk images and cold caches). If we start the proxy too early, QEMU fails
+			// with "Could not set up host forwarding rule ... :22".
+			waitBeforeProxy = 2 * time.Minute
+			dialTimeout     = 200 * time.Millisecond
+		)
+
+		select {
+		case <-time.After(waitBeforeProxy):
+		case <-c.ctx.Done():
+			return
+		}
+
+		d := net.Dialer{Timeout: dialTimeout}
+		conn, err := d.DialContext(c.ctx, "tcp", "127.0.0.1:22")
+		if err == nil {
+			_ = conn.Close()
+			c.logger.Infof("vrnetlab ssh proxy skipped: port 22 already in use by NOS/QEMU")
+			return
+		}
+
 		if err := runTCPProxy(c.ctx, sshProxyListenAddr, vrnetlabMgmtSSHAddr); err != nil {
 			c.logger.Warnf("vrnetlab ssh proxy failed: %s", err)
 		}
 	}()
-	c.logger.Infof("vrnetlab ssh proxy enabled: %s -> %s", sshProxyListenAddr, vrnetlabMgmtSSHAddr)
+	c.logger.Infof("vrnetlab ssh proxy armed (will start if port 22 is free): %s -> %s", sshProxyListenAddr, vrnetlabMgmtSSHAddr)
 }
 
 func (c *clabernetes) ensureVrnetlabMgmtVeth() error {

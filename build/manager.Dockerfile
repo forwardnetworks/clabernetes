@@ -1,4 +1,6 @@
-FROM --platform=$BUILDPLATFORM golang:1.24-bookworm AS builder
+# Use a public mirror to avoid Docker Hub unauthenticated pull rate limits.
+# Avoid `--platform=$BUILDPLATFORM` to keep compatibility with the legacy docker builder.
+FROM public.ecr.aws/docker/library/golang:1.24-bookworm AS builder
 
 ARG VERSION
 ARG TARGETOS
@@ -31,7 +33,8 @@ RUN CGO_ENABLED=0 \
     build/manager \
     cmd/clabernetes/main.go
 
-FROM --platform=$TARGETPLATFORM gcr.io/distroless/static-debian12:nonroot
+# Avoid `--platform=$TARGETPLATFORM` to keep compatibility with the legacy docker builder.
+FROM gcr.io/distroless/static-debian12:nonroot
 
 WORKDIR /clabernetes
 COPY --from=builder --chown=nonroot:nonroot /clabernetes/certificates /clabernetes/certificates

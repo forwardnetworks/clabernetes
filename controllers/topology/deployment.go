@@ -501,8 +501,52 @@ func (r *DeploymentReconciler) renderDeploymentScheduling(
 		deployment.Spec.Template.Spec.Affinity = owningTopology.Spec.Deployment.Scheduling.Affinity
 	}
 
-	// Nothing else to do for scheduling here; node placement is controlled by Topology scheduling
-	// config and cluster policies.
+	// Skyforge: optionally enforce per-topology spreading without requiring CRD support for
+	// spec.deployment.scheduling.affinity (which may be pruned in some deployments).
+	//
+	// This is driven by a Topology label set by Skyforge when creating the Topology CR.
+	// - spread-required: hard anti-affinity by topologyOwner (multi-node required)
+	// - spread-preferred: soft anti-affinity by topologyOwner
+	//
+	// This keeps the control surface stable for Skyforge without forking the Topology CRD.
+	//
+	// IMPORTANT: Apply this even if an (empty) Affinity object is present; some clusters
+	// default/prune the CRD fields in ways that result in Affinity != nil but with no
+	// podAntiAffinity configured, which would otherwise defeat multi-node E2E/VXLAN smoke.
+	if owningTopology != nil {
+		mode := strings.TrimSpace(owningTopology.Labels["skyforge.forwardnetworks.com/scheduling"])
+		if mode == "spread-required" || mode == "spread-preferred" {
+			term := k8scorev1.PodAffinityTerm{
+				LabelSelector: &metav1.LabelSelector{
+					MatchExpressions: []metav1.LabelSelectorRequirement{
+						{
+							Key:      clabernetesconstants.LabelTopologyOwner,
+							Operator: metav1.LabelSelectorOpIn,
+							Values:   []string{owningTopology.Name},
+						},
+					},
+				},
+				TopologyKey: "kubernetes.io/hostname",
+			}
+			if deployment.Spec.Template.Spec.Affinity == nil {
+				deployment.Spec.Template.Spec.Affinity = &k8scorev1.Affinity{}
+			}
+			if deployment.Spec.Template.Spec.Affinity.PodAntiAffinity == nil {
+				deployment.Spec.Template.Spec.Affinity.PodAntiAffinity = &k8scorev1.PodAntiAffinity{}
+			}
+
+			paa := deployment.Spec.Template.Spec.Affinity.PodAntiAffinity
+			if mode == "spread-required" {
+				// Ensure we have at least one required term; append ours to avoid clobbering
+				// any user-supplied constraints.
+				paa.RequiredDuringSchedulingIgnoredDuringExecution = append(paa.RequiredDuringSchedulingIgnoredDuringExecution, term)
+			} else {
+				paa.PreferredDuringSchedulingIgnoredDuringExecution = append(paa.PreferredDuringSchedulingIgnoredDuringExecution,
+					k8scorev1.WeightedPodAffinityTerm{Weight: 100, PodAffinityTerm: term},
+				)
+			}
+		}
+	}
 }
 
 func (r *DeploymentReconciler) renderDeploymentVolumes( //nolint:funlen
@@ -857,6 +901,38 @@ func (r *DeploymentReconciler) renderDeploymentContainer(
 		TerminationMessagePath:   "/dev/termination-log",
 		TerminationMessagePolicy: "File",
 		ImagePullPolicy:          k8scorev1.PullPolicy(imagePullPolicy),
+	}
+
+	// In native mode, clabernetes historically only mounted filesFromConfigMap into the launcher
+	// container. For Skyforge/netlab, qemu-based NOS containers (vrnetlab) must see:
+	// - netlab outputs under /tmp/skyforge-c9s/... (startup snippets, node_files, etc)
+	// - startup-config at /config/startup-config.cfg
+	//
+	// Mount a conservative subset of the "filesFromConfigMap" mounts into the NOS container too.
+	// We intentionally avoid mounting /clabernetes/* into the NOS container (it already has /clabernetes).
+	{
+		seen := map[string]struct{}{}
+		for i := range nosContainer.VolumeMounts {
+			seen[strings.TrimSpace(nosContainer.VolumeMounts[i].MountPath)] = struct{}{}
+		}
+		for _, vm := range volumeMountsFromCommonSpec {
+			mp := strings.TrimSpace(vm.MountPath)
+			if mp == "" {
+				continue
+			}
+			if mp == "/clabernetes" || strings.HasPrefix(mp, "/clabernetes/") {
+				continue
+			}
+			// Keep this tight: only mount the paths we rely on for netlab-c9s native mode.
+			if !(strings.HasPrefix(mp, "/tmp/") || strings.HasPrefix(mp, "/config/")) {
+				continue
+			}
+			if _, ok := seen[mp]; ok {
+				continue
+			}
+			nosContainer.VolumeMounts = append(nosContainer.VolumeMounts, vm)
+			seen[mp] = struct{}{}
+		}
 	}
 
 	// Best-effort support for common containerlab node overrides when running in native mode.
@@ -1499,6 +1575,60 @@ exec ./iol.bin "$IOL_PID" -e "$slots" -s 0 -c config.txt -n 1024
 					}
 				}
 
+				// Skyforge C9s rewrites netlab/node_files binds into absolute paths under
+				// /tmp/skyforge-c9s/<topology>/... so containerlab-in-launcher can "bind" them.
+				//
+				// In native mode, those paths do *not* exist on the Kubernetes node filesystem; they
+				// exist only as ConfigMap-mounted files in the launcher container. Translating them
+				// into HostPath mounts breaks (kubelet/runc sees missing paths or creates directories),
+				// and causes the NOS container to crashloop.
+				//
+				// Instead, if this bind source matches an entry in FilesFromConfigMap for this node,
+				// mount that ConfigMap file directly into the NOS container at the desired path.
+				if strings.HasPrefix(hostPath, "/tmp/skyforge-c9s/") {
+					for _, f := range owningTopology.Spec.Deployment.FilesFromConfigMap[nodeName] {
+						if strings.TrimSpace(f.ConfigMapName) == "" || strings.TrimSpace(f.ConfigMapPath) == "" {
+							continue
+						}
+						if strings.TrimSpace(f.FilePath) != hostPath {
+							continue
+						}
+						volumeName := clabernetesutilkubernetes.EnforceDNSLabelConvention(
+							clabernetesutilkubernetes.SafeConcatNameKubernetes(
+								f.ConfigMapName,
+								f.ConfigMapPath,
+							),
+						)
+						// The volume should already exist as part of FilesFromConfigMap wiring, but
+						// keep this best-effort and avoid adding mounts to non-existent volumes.
+						if _, ok := existingVolumes[volumeName]; ok {
+							nosContainer.VolumeMounts = append(
+								nosContainer.VolumeMounts,
+								k8scorev1.VolumeMount{
+									Name:      volumeName,
+									ReadOnly:  true, // ConfigMap is always read-only
+									MountPath: containerPath,
+									SubPath:   f.ConfigMapPath,
+								},
+							)
+							existingMounts[containerPath] = struct{}{}
+						} else {
+							r.log.Warnf(
+								"skipping native bind mount for %q -> %q: configmap volume %q not found",
+								hostPath,
+								containerPath,
+								volumeName,
+							)
+						}
+						// Either way, do not translate /tmp/skyforge-c9s binds into HostPath volumes.
+						hostPath = ""
+						break
+					}
+					if hostPath == "" {
+						continue
+					}
+				}
+
 				volName := fmt.Sprintf("bind-%d", idx)
 				for i := 2; ; i++ {
 					if _, ok := existingVolumes[volName]; !ok {
@@ -1531,10 +1661,32 @@ exec ./iol.bin "$IOL_PID" -e "$slots" -s 0 -c config.txt -n 1024
 			}
 		}
 
-		if strings.TrimSpace(nodeDef.Cmd) != "" {
-			nosContainer.Command = []string{"sh", "-c", nodeDef.Cmd}
-		} else if strings.TrimSpace(nodeDef.Entrypoint) != "" {
-			nosContainer.Command = []string{"sh", "-c", nodeDef.Entrypoint}
+		// Containerlab semantics:
+		// - `entrypoint:` overrides the container entrypoint
+		// - `cmd:` overrides the container args (CMD)
+		//
+		// In Kubernetes:
+		// - `Command` is entrypoint
+		// - `Args` is CMD
+		//
+		// IMPORTANT: for most NOS images (vrnetlab, etc), `cmd:` contains CLI flags like
+		// `--connection-mode tc` which must be passed as args to the image entrypoint.
+		// Treating it as `sh -c ...` breaks (for example `sh: Illegal option --`).
+		//
+		// For linux nodes, `cmd:` is commonly a shell string (e.g. `sleep infinity`),
+		// so we keep the `sh -c` behavior there.
+		kind := strings.ToLower(strings.TrimSpace(nodeDef.Kind))
+		if ep := strings.TrimSpace(nodeDef.Entrypoint); ep != "" {
+			// Best-effort: split on whitespace to form an exec-style entrypoint.
+			// (If users need shell features, they can set entrypoint to `sh -c ...` explicitly.)
+			nosContainer.Command = strings.Fields(ep)
+		}
+		if cmd := strings.TrimSpace(nodeDef.Cmd); cmd != "" {
+			if kind == "linux" {
+				nosContainer.Command = []string{"sh", "-c", cmd}
+			} else {
+				nosContainer.Args = strings.Fields(cmd)
+			}
 		}
 	}
 
