@@ -28,6 +28,16 @@ func (c *clabernetes) maybeStartVrnetlabSSHProxy() {
 		return
 	}
 
+	// Skyforge default: do not bind a proxy on TCP/22 in the pod netns.
+	//
+	// Most vrnetlab images start QEMU with user networking + hostfwd rules that bind TCP/22
+	// inside the pod netns. Any sidecar listener on :22 (including this proxy) can race and
+	// cause QEMU to fail with:
+	//   "Could not set up host forwarding rule 'tcp:0.0.0.0:22-...:22'"
+	//
+	// Operators can explicitly opt in to the proxy by setting SKYFORGE_VRNETLAB_SSH_PROXY=true.
+	enableProxy := strings.EqualFold(strings.TrimSpace(os.Getenv("SKYFORGE_VRNETLAB_SSH_PROXY")), "true")
+
 	// vrnetlab uses iouyap/qemu user-space networking which does not handle
 	// CHECKSUM_PARTIAL / TSO/GSO packets well on veth pairs. Disable offloads on
 	// the internal management veth to ensure TCP (SSH) works reliably.
@@ -40,6 +50,10 @@ func (c *clabernetes) maybeStartVrnetlabSSHProxy() {
 	}
 	c.disableInterfaceOffloads("vrl-mgmt0")
 	c.disableInterfaceOffloads("vrl-mgmt1")
+
+	if !enableProxy {
+		return
+	}
 
 	go func() {
 		// Many vrnetlab images start QEMU with user networking and bind hostfwd ports
