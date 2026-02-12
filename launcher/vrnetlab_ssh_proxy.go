@@ -15,7 +15,9 @@ import (
 
 const (
 	vrnetlabMgmtSSHAddr = "169.254.100.2:22"
+	vrnetlabMgmtSNMPAddr = "169.254.100.2:161"
 	sshProxyListenAddr  = ":22"
+	snmpProxyListenAddr = ":161"
 )
 
 func (c *clabernetes) maybeStartVrnetlabSSHProxy() {
@@ -55,6 +57,17 @@ func (c *clabernetes) maybeStartVrnetlabSSHProxy() {
 		return
 	}
 
+	// SNMP (UDP/161) is needed for performance collection, and unlike TCP/22 there
+	// is no QEMU hostfwd port-binding race to worry about (hostfwd is TCP-only).
+	//
+	// Start the UDP proxy immediately so collectors can reach podIP:161 reliably.
+	go func() {
+		if err := runUDPProxy(c.ctx, snmpProxyListenAddr, vrnetlabMgmtSNMPAddr); err != nil {
+			c.logger.Warnf("vrnetlab snmp proxy failed: %s", err)
+		}
+	}()
+	c.logger.Infof("vrnetlab snmp proxy started: %s -> %s", snmpProxyListenAddr, vrnetlabMgmtSNMPAddr)
+
 	go func() {
 		// Many vrnetlab images start QEMU with user networking and bind hostfwd ports
 		// (including TCP/22) inside the pod netns. If we bind :22 first, QEMU will fail
@@ -65,9 +78,16 @@ func (c *clabernetes) maybeStartVrnetlabSSHProxy() {
 			// Some NOS images take >60s before QEMU binds hostfwd ports (esp. with large
 			// disk images and cold caches). If we start the proxy too early, QEMU fails
 			// with "Could not set up host forwarding rule ... :22".
-			waitBeforeProxy = 2 * time.Minute
+			defaultWaitBeforeProxy = 2 * time.Minute
 			dialTimeout     = 200 * time.Millisecond
 		)
+
+		waitBeforeProxy := defaultWaitBeforeProxy
+		// Cisco IOL is not QEMU-based; it won't bind port 22 in the pod netns. Waiting
+		// 2 minutes here just makes deployments feel broken.
+		if strings.Contains(img, "/cisco_iol:") || strings.Contains(img, "/cisco_iol@") || strings.Contains(img, "/cisco_iol") {
+			waitBeforeProxy = 5 * time.Second
+		}
 
 		select {
 		case <-time.After(waitBeforeProxy):
@@ -203,4 +223,68 @@ func handleProxyConn(ctx context.Context, inbound net.Conn, targetAddr string) {
 		done <- struct{}{}
 	}()
 	<-done
+}
+
+func runUDPProxy(ctx context.Context, listenAddr, targetAddr string) error {
+	laddr, err := net.ResolveUDPAddr("udp", listenAddr)
+	if err != nil {
+		return fmt.Errorf("resolve udp listen %s: %w", listenAddr, err)
+	}
+	raddr, err := net.ResolveUDPAddr("udp", targetAddr)
+	if err != nil {
+		return fmt.Errorf("resolve udp target %s: %w", targetAddr, err)
+	}
+
+	ln, err := net.ListenUDP("udp", laddr)
+	if err != nil {
+		return fmt.Errorf("listen udp %s: %w", listenAddr, err)
+	}
+	defer ln.Close()
+
+	// Close the socket on shutdown so ReadFromUDP unblocks.
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+	}()
+
+	buf := make([]byte, 64*1024)
+	for {
+		n, clientAddr, err := ln.ReadFromUDP(buf)
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+			}
+			continue
+		}
+
+		// Copy packet for the goroutine.
+		pkt := make([]byte, n)
+		copy(pkt, buf[:n])
+
+		go func(pkt []byte, clientAddr *net.UDPAddr) {
+			c := net.Dialer{Timeout: 2 * time.Second}
+			out, err := c.DialContext(ctx, "udp", raddr.String())
+			if err != nil {
+				return
+			}
+			defer out.Close()
+
+			udpOut, ok := out.(*net.UDPConn)
+			if ok {
+				_ = udpOut.SetDeadline(time.Now().Add(3 * time.Second))
+			}
+
+			_, _ = out.Write(pkt)
+
+			// Forward a single response datagram back to the client.
+			resp := make([]byte, 64*1024)
+			rn, err := out.Read(resp)
+			if err != nil || rn <= 0 {
+				return
+			}
+			_, _ = ln.WriteToUDP(resp[:rn], clientAddr)
+		}(pkt, clientAddr)
+	}
 }
