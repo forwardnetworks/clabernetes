@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -55,6 +56,34 @@ func (c *clabernetes) maybeStartVrnetlabSSHProxy() {
 
 	if !enableProxy {
 		return
+	}
+
+	// Proxy common TCP "management plane" ports from podIP:<port> -> 169.254.100.2:<port>.
+	//
+	// We intentionally avoid proxying TCP/22 here (handled below with extra safety)
+	// due to common QEMU hostfwd behavior.
+	//
+	// NOTE: the server-side web UI proxy expects HTTPS (443) to work for NOSes that
+	// expose a GUI, so include 443 by default.
+	for _, p := range parsePortList(os.Getenv("SKYFORGE_VRNETLAB_TCP_PROXY_PORTS"), []int{443, 80}) {
+		if p <= 0 || p == 22 {
+			continue
+		}
+		listenAddr := fmt.Sprintf(":%d", p)
+		targetAddr := fmt.Sprintf("169.254.100.2:%d", p)
+
+		// If something is already bound, don't compete.
+		if portBound(c.ctx, p) {
+			c.logger.Infof("vrnetlab tcp proxy skipped: port %d already in use", p)
+			continue
+		}
+
+		go func(listenAddr, targetAddr string, p int) {
+			if err := runTCPProxy(c.ctx, listenAddr, targetAddr); err != nil {
+				c.logger.Warnf("vrnetlab tcp proxy failed (port=%d): %s", p, err)
+			}
+		}(listenAddr, targetAddr, p)
+		c.logger.Infof("vrnetlab tcp proxy started (port=%d): %s -> %s", p, listenAddr, targetAddr)
 	}
 
 	// SNMP (UDP/161) is needed for performance collection, and unlike TCP/22 there
@@ -223,6 +252,51 @@ func handleProxyConn(ctx context.Context, inbound net.Conn, targetAddr string) {
 		done <- struct{}{}
 	}()
 	<-done
+}
+
+func parsePortList(v string, defaults []int) []int {
+	raw := strings.TrimSpace(v)
+	if raw == "" {
+		out := make([]int, 0, len(defaults))
+		for _, p := range defaults {
+			if p > 0 {
+				out = append(out, p)
+			}
+		}
+		return out
+	}
+
+	seen := map[int]struct{}{}
+	out := []int{}
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		n, err := strconv.Atoi(part)
+		if err != nil || n <= 0 || n > 65535 {
+			continue
+		}
+		if _, ok := seen[n]; ok {
+			continue
+		}
+		seen[n] = struct{}{}
+		out = append(out, n)
+	}
+	return out
+}
+
+func portBound(ctx context.Context, port int) bool {
+	if port <= 0 || port > 65535 {
+		return false
+	}
+	d := net.Dialer{Timeout: 200 * time.Millisecond}
+	conn, err := d.DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err == nil {
+		_ = conn.Close()
+		return true
+	}
+	return false
 }
 
 func runUDPProxy(ctx context.Context, listenAddr, targetAddr string) error {
